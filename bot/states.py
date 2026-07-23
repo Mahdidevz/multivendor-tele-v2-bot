@@ -12,6 +12,8 @@ class AddServerStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_username = State()
     waiting_for_password = State()
+    # 🌟 [جدید] مرحله اشتراک‌گذاری انتخابی سرور (Owner Only)
+    waiting_for_vendor_selection = State()
 
 class AddPlanStates(StatesGroup):
     # مرحله انتخاب دسته حذف و انتخاب سرور جایگزین شد

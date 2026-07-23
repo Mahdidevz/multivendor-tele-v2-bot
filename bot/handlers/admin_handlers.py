@@ -1,6 +1,7 @@
 import os
-import time
 import random
+import logging
+from typing import Sequence
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -10,10 +11,10 @@ from sqlalchemy.orm import selectinload
 from aiogram.fsm.context import FSMContext
 
 from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates
-from core.database.models import Plan, Vendor, Transaction, Server
+from core.database.models import Plan, Vendor, Transaction, Server, VendorServer
+from core.services.panel_client import MarzbanClient
 
-# 🌟 وقتی کلاینتت آماده بود این کامنت را باز کن:
-# from core.services.panel_client import MarzbanClient
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -127,38 +128,66 @@ async def process_vendor_card(message: types.Message, state: FSMContext, db_sess
 # ==========================================
 @router.callback_query(F.data == "admin_view_servers")
 async def admin_view_servers(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.from_user: return
+    if not callback.from_user:
+        await callback.answer()
+        return
+
     vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    if not vendor: return
+    if not vendor:
+        await callback.answer("❌ دسترسی یافت نشد.", show_alert=True)
+        return
 
     owner_id_str = os.getenv("OWNER_ID")
     is_owner = bool(owner_id_str and callback.from_user.id == int(owner_id_str))
 
-    stmt = select(Server).where(or_(Server.vendor_id == vendor.id, Server.is_shared == True))
+    # 🌟 سرورهای قابل دسترس برای این فروشنده:
+    #   a) سرورهایی که خودش مالک آن است (Server.vendor_id == vendor.id)
+    #   b) سرورهایی که از طریق جدول VendorServer با او اشتراک داده شده است
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
+    stmt = select(Server).where(
+        or_(
+            Server.vendor_id == vendor.id,
+            Server.id.in_(shared_subq)
+        )
+    )
     servers = (await db_session.execute(stmt)).scalars().all()
 
-    kb = []
-    if is_owner: kb.append([InlineKeyboardButton(text="➕ افزودن سرور اشتراکی (عمومی)", callback_data="add_srv_shared")])
+    kb: list[list[InlineKeyboardButton]] = []
+    if is_owner:
+        kb.append([InlineKeyboardButton(text="➕ افزودن سرور (اشتراک انتخابی)", callback_data="add_srv_selective")])
     kb.append([InlineKeyboardButton(text="➕ افزودن سرور اختصاصی", callback_data="add_srv_private")])
 
     for srv in servers:
         icon = "🟢" if srv.is_active else "🔴"
-        type_str = "اشتراکی" if srv.is_shared else "اختصاصی"
-        kb.append([InlineKeyboardButton(text=f"{icon} {srv.name} ({type_str})", callback_data=f"srv_det_{srv.id}")])
+        # 🌟 نمایش «مالک/اشتراکی» بر اساس مالکیت واقعی
+        ownership = "مالک" if srv.vendor_id == vendor.id else "اشتراکی"
+        kb.append([InlineKeyboardButton(text=f"{icon} {srv.name} ({ownership})", callback_data=f"srv_det_{srv.id}")])
 
     kb.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
     if isinstance(callback.message, types.Message):
-        await callback.message.edit_text("🖥 <b>مدیریت سرورها</b>\n\nسرورهای متصل در سیستم:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await callback.message.edit_text(
+            "🖥 <b>مدیریت سرورها</b>\n\nسرورهای قابل دسترس در سیستم:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
     await callback.answer()
 
 
-@router.callback_query(F.data.in_(["add_srv_shared", "add_srv_private"]))
+@router.callback_query(F.data.in_(["add_srv_selective", "add_srv_private"]))
 async def start_add_server(callback: types.CallbackQuery, state: FSMContext):
-    is_shared = (callback.data == "add_srv_shared")
-    await state.update_data(is_shared=is_shared)
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    # 🌟 «selective» یعنی فلو مالک با اشتراک‌گذاری انتخابی؛ «private» یعنی سرور اختصاصی بدون اشتراک
+    is_selective = (callback.data == "add_srv_selective")
+    await state.update_data(is_selective=is_selective, is_private=(not is_selective))
+
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="admin_view_servers")]])
     if isinstance(callback.message, types.Message):
-        await callback.message.edit_text("🖥 <b>افزودن سرور</b>\n\nنام سرور را وارد کنید (مثال: سرور آلمان ۱):", reply_markup=cancel_kb)
+        await callback.message.edit_text(
+            "🖥 <b>افزودن سرور</b>\n\nنام سرور را وارد کنید (مثال: سرور آلمان ۱):",
+            reply_markup=cancel_kb
+        )
     await state.set_state(AddServerStates.waiting_for_name)
     await callback.answer()
 
@@ -185,23 +214,97 @@ async def srv_user(message: types.Message, state: FSMContext):
 
 @router.message(AddServerStates.waiting_for_password)
 async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncSession):
-    if not message.text or not message.from_user: return
+    if not message.text or not message.from_user:
+        return
+
     data = await state.get_data()
     password = message.text.strip()
 
     vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))).scalar_one_or_none()
-    if not vendor: return
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
 
-    # --- جای لاگین و تست API با MarzbanClient ---
+    # 🌟 تست واقعی اتصال به API قبل از ثبت سرور
+    srv_url: str = str(data.get("srv_url", ""))
+    srv_user: str = str(data.get("srv_user", ""))
+    is_connected = await _test_marzban_connection(srv_url, srv_user, password)
+    if not is_connected:
+        await message.answer(
+            "❌ <b>اتصال به پنل ناموفق بود.</b>\n"
+            "لطفاً آدرس پنل، نام کاربری و رمز عبور را بررسی کنید و دوباره تلاش کنید.\n"
+            "برای شروع مجدد از منوی مدیریت سرورها استفاده کنید."
+        )
+        await state.clear()
+        text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
+        if text:
+            await message.answer(text, reply_markup=reply_markup)
+        return
 
+    is_selective = bool(data.get("is_selective", False))
+
+    # 🌟 برای فلو Owner (selective): پس از موفقیت API، به مرحله انتخاب شرکا منتقل میشویم.
+    if is_selective:
+        # استخراج لیست شرکای فعال (به جز خود مالک)
+        stmt_vendors = select(Vendor).where(
+            Vendor.is_active == True,
+            Vendor.id != vendor.id
+        ).order_by(Vendor.id.asc())
+        all_vendors = (await db_session.execute(stmt_vendors)).scalars().all()
+
+        if not all_vendors:
+            # شرکایی وجود ندارند؛ سرور را بدون اشتراک ثبت میکنیم
+            new_srv = Server(
+                vendor_id=vendor.id,
+                is_shared=False,
+                name=data["srv_name"],
+                panel_url=data["srv_url"],
+                username=data["srv_user"],
+                password=password,
+                is_active=True,
+            )
+            db_session.add(new_srv)
+            await db_session.commit()
+
+            await message.answer(
+                "✅ <b>سرور ثبت شد.</b>\n"
+                "ℹ️ هیچ شرک فعالی برای اشتراکگذاری وجود نداشت، بنابراین سرور اختصاصی شما باقی ماند."
+            )
+            await state.clear()
+            text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
+            if text:
+                await message.answer(text, reply_markup=reply_markup)
+            return
+
+        # ذخیره رمز عبور و شناسه مالک برای مرحله نهایی
+        await state.update_data(
+            srv_password=password,
+            owner_vendor_id=vendor.id,
+            selected_vendor_ids=[],  # مجموعه خالی از انتخابها
+        )
+
+        kb = _build_vendor_selection_keyboard(all_vendors, selected_ids=[])
+        if isinstance(message, types.Message):
+            await message.answer(
+                "👥 <b>مرحله اشتراکگذاری انتخابی</b>\n\n"
+                "سرور با موفقیت به API متصل شد.\n"
+                "اکنون انتخاب کنید کدام شرکا به این سرور دسترسی داشته باشند:\n"
+                "✅ = انتخاب شده | ⬜ = انتخاب نشده",
+                reply_markup=kb
+            )
+        await state.set_state(AddServerStates.waiting_for_vendor_selection)
+        return
+
+    # 🌟 برای فلو private (یا غیر-owner): ثبت مستقیم سرور اختصاصی
     new_srv = Server(
-        vendor_id=None if data['is_shared'] else vendor.id,
-        is_shared=data['is_shared'],
-        name=data['srv_name'],
-        panel_url=data['srv_url'],
-        username=data['srv_user'],
+        vendor_id=vendor.id,
+        is_shared=False,
+        name=data["srv_name"],
+        panel_url=data["srv_url"],
+        username=data["srv_user"],
         password=password,
-        is_active=True
+        is_active=True,
     )
     db_session.add(new_srv)
     await db_session.commit()
@@ -210,17 +313,162 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
     await state.clear()
 
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
-    if text: await message.answer(text, reply_markup=reply_markup)
+    if text:
+        await message.answer(text, reply_markup=reply_markup)
+
+
+async def _test_marzban_connection(base_url: str, username: str, password: str) -> bool:
+    """
+    تست اتصال به پنل Marzban قبل از ثبت سرور.
+    در صورت موفقیت True و در غیر این صورت False برمیگرداند.
+    """
+    # گارد: بررسی مقادیر ورودی خالی
+    if not base_url or not username or not password:
+        return False
+
+    client = MarzbanClient(base_url=base_url, username=username, password=password)
+    is_connected = False
+    try:
+        is_connected = await client.login()
+    except Exception as e:
+        logger.error(f"Marzban connection test failed for {base_url}: {e}")
+        is_connected = False
+    finally:
+        await client.close()
+    return is_connected
+
+
+def _build_vendor_selection_keyboard(
+    vendors: Sequence[Vendor], selected_ids: list[int]
+) -> InlineKeyboardMarkup:
+    """ساخت کیبورد انتخاب شرکا با حالت toggle."""
+    kb: list[list[InlineKeyboardButton]] = []
+    for v in vendors:
+        mark = "✅" if v.id in selected_ids else "⬜"
+        kb.append([
+            InlineKeyboardButton(
+                text=f"{mark} {v.name}",
+                callback_data=f"srv_togv_{v.id}",
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="💾 ثبت نهایی سرور", callback_data="srv_save_vendor_sharing")])
+    kb.append([InlineKeyboardButton(text="❌ لغو", callback_data="admin_view_servers")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.callback_query(AddServerStates.waiting_for_vendor_selection, F.data.startswith("srv_togv_"))
+async def toggle_vendor_in_sharing(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    vendor_id_str = callback.data.replace("srv_togv_", "")
+    if not vendor_id_str.isdigit():
+        await callback.answer("❌ داده نامعتبر.", show_alert=True)
+        return
+    toggled_vendor_id = int(vendor_id_str)
+
+    data = await state.get_data()
+    selected_ids: list[int] = list(data.get("selected_vendor_ids", []))
+
+    if toggled_vendor_id in selected_ids:
+        selected_ids.remove(toggled_vendor_id)
+    else:
+        selected_ids.append(toggled_vendor_id)
+
+    await state.update_data(selected_vendor_ids=selected_ids)
+
+    # بازسازی کیبورد با انتخاب جدید
+    stmt_vendors = select(Vendor).where(
+        Vendor.is_active == True,
+        Vendor.id != data.get("owner_vendor_id")
+    ).order_by(Vendor.id.asc())
+    all_vendors = (await db_session.execute(stmt_vendors)).scalars().all()
+
+    kb = _build_vendor_selection_keyboard(all_vendors, selected_ids=selected_ids)
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(AddServerStates.waiting_for_vendor_selection, F.data == "srv_save_vendor_sharing")
+async def save_server_with_vendor_sharing(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+
+    # گارد: بررسی وجود تمام کلیدهای لازم در FSM
+    required_keys = ("srv_name", "srv_url", "srv_user", "srv_password", "owner_vendor_id")
+    if not all(k in data for k in required_keys):
+        await callback.answer("❌ اطلاعات سرور ناقص است. لطفاً دوباره تلاش کنید.", show_alert=True)
+        await state.clear()
+        text, reply_markup = await get_admin_panel_content(callback.from_user.id, db_session)
+        if text and isinstance(callback.message, types.Message):
+            await callback.message.edit_text(text, reply_markup=reply_markup)
+        return
+
+    owner_vendor_id: int = int(data["owner_vendor_id"])
+    selected_vendor_ids: list[int] = list(data.get("selected_vendor_ids", []))
+
+    # ساخت و ذخیره سرور مالک
+    new_srv = Server(
+        vendor_id=owner_vendor_id,
+        is_shared=False,  # دیگر سرور عمومی نیست؛ اشتراک انتخابی است
+        name=data["srv_name"],
+        panel_url=data["srv_url"],
+        username=data["srv_user"],
+        password=data["srv_password"],
+        is_active=True,
+    )
+    db_session.add(new_srv)
+    await db_session.flush()  # گرفتن new_srv.id بدون بستن تراکنش
+
+    # ساخت روابط اشتراک‌گذاری در جدول VendorServer
+    for vid in selected_vendor_ids:
+        db_session.add(VendorServer(vendor_id=vid, server_id=new_srv.id))
+
+    await db_session.commit()
+    await state.clear()
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            f"✅ <b>سرور {new_srv.name} با موفقیت ثبت شد.</b>\n"
+            f"👥 تعداد شرکای دسترسی‌یافته: <b>{len(selected_vendor_ids)}</b>"
+        )
+
+    # 🌟 بازگشت خودکار به پنل ادمین
+    text, reply_markup = await get_admin_panel_content(callback.from_user.id, db_session)
+    if text and isinstance(callback.message, types.Message):
+        await callback.message.answer(text, reply_markup=reply_markup)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("srv_det_"))
 async def admin_server_details(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data or not callback.from_user: return
-    srv_id_str = callback.data.replace("srv_det_", "")
-    if not srv_id_str.isdigit(): return
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
 
-    server = (await db_session.execute(select(Server).where(Server.id == int(srv_id_str)))).scalar_one_or_none()
-    if not server: return
+    srv_id_str = callback.data.replace("srv_det_", "")
+    if not srv_id_str.isdigit():
+        await callback.answer("❌ شناسه سرور نامعتبر است.", show_alert=True)
+        return
+
+    # 🌟 بارگذاری سرور بههمراه روابط vendor و vendor_servers.vendor برای جلوگیری از خطای Lazy Load در Async
+    stmt = (
+        select(Server)
+        .options(
+            selectinload(Server.vendor),
+            selectinload(Server.vendor_servers).selectinload(VendorServer.vendor),
+        )
+        .where(Server.id == int(srv_id_str))
+    )
+    server = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not server:
+        await callback.answer("❌ سرور یافت نشد.", show_alert=True)
+        return
 
     owner_id_str = os.getenv("OWNER_ID")
     is_owner = bool(owner_id_str and callback.from_user.id == int(owner_id_str))
@@ -228,16 +476,29 @@ async def admin_server_details(callback: types.CallbackQuery, db_session: AsyncS
     status_text = "🟢 در حال کار" if server.is_active else "🔴 غیرفعال"
     type_text = "اشتراکی (عمومی)" if server.is_shared else "اختصاصی"
 
+    # 🌟 فهرست شرکایی که این سرور با آنها اشتراک داده شده است
+    shared_vendors: list[Vendor] = [vs.vendor for vs in server.vendor_servers if vs.vendor is not None]
+    if shared_vendors:
+        shared_names = "\n".join(f"   • {v.name}" for v in shared_vendors)
+    else:
+        shared_names = "   —"
+
     text = (
         f"🖥 <b>سرور: {server.name}</b> ({type_text})\n\n"
         f"🔗 <b>آدرس:</b> <code>{server.panel_url}</code>\n"
-        f"👁‍🗨 <b>وضعیت:</b> {status_text}\n"
+        f"👁🗨 <b>وضعیت:</b> {status_text}\n"
+        "〰️〰️〰️〰️〰️〰️〰️\n"
+        f"👥 <b>شرکای دارای دسترسی:</b>\n{shared_names}\n"
         "〰️〰️〰️〰️〰️〰️〰️\n"
         f"📊 در اینجا اطلاعات منابع از طریق API لود خواهد شد...\n"
     )
 
-    kb = []
-    if is_owner or (server.vendor_id and server.vendor.telegram_id == callback.from_user.id):
+    # 🌟 بررسی مالکیت: فقط مالک سرور یا Owner رسمی میتواند ویرایش کند
+    server_owner_tg_id = server.vendor.telegram_id if server.vendor else None
+    can_manage = bool(is_owner or (server_owner_tg_id is not None and server_owner_tg_id == callback.from_user.id))
+
+    kb: list[list[InlineKeyboardButton]] = []
+    if can_manage:
         kb.append([InlineKeyboardButton(text="تغییر وضعیت 🟢/🔴", callback_data=f"srv_tog_{server.id}")])
         kb.append([InlineKeyboardButton(text="🗑 حذف سرور", callback_data=f"srv_del_{server.id}")])
 
@@ -249,25 +510,57 @@ async def admin_server_details(callback: types.CallbackQuery, db_session: AsyncS
 
 @router.callback_query(F.data.startswith("srv_tog_"))
 async def toggle_server_status(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
-    srv_id = int(callback.data.replace("srv_tog_", ""))
+    if not callback.data:
+        await callback.answer()
+        return
+
+    srv_id_str = callback.data.replace("srv_tog_", "")
+    if not srv_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+
+    srv_id = int(srv_id_str)
     server = (await db_session.execute(select(Server).where(Server.id == srv_id))).scalar_one_or_none()
-    if server:
-        server.is_active = not server.is_active
-        await db_session.commit()
-        callback.data = f"srv_det_{server.id}"
-        await admin_server_details(callback, db_session)
+    if not server:
+        await callback.answer("❌ سرور یافت نشد.", show_alert=True)
+        return
+
+    server.is_active = not server.is_active
+    await db_session.commit()
+
+    # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
+    new_callback = callback.model_copy(update={"data": f"srv_det_{server.id}"})
+    await admin_server_details(new_callback, db_session)
+
 
 @router.callback_query(F.data.startswith("srv_del_"))
 async def delete_server(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
-    srv_id = int(callback.data.replace("srv_del_", ""))
+    if not callback.data:
+        await callback.answer()
+        return
+
+    srv_id_str = callback.data.replace("srv_del_", "")
+    if not srv_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+
+    srv_id = int(srv_id_str)
     server = (await db_session.execute(select(Server).where(Server.id == srv_id))).scalar_one_or_none()
-    if server:
-        await db_session.delete(server)
-        await db_session.commit()
-        await callback.answer("✅ سرور حذف شد.", show_alert=True)
-        await admin_view_servers(callback, db_session)
+    if not server:
+        await callback.answer("❌ سرور یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 روابط VendorServer بهصورت Cascade روی DB حذف میشوند؛ nonetheless صریحًا پاک میکنیم تا سشن sync بماند
+    vs_stmt = select(VendorServer).where(VendorServer.server_id == srv_id)
+    vs_rows = (await db_session.execute(vs_stmt)).scalars().all()
+    for vs in vs_rows:
+        await db_session.delete(vs)
+
+    await db_session.delete(server)
+    await db_session.commit()
+
+    await callback.answer("✅ سرور حذف شد.", show_alert=True)
+    await admin_view_servers(callback, db_session)
 
 
 # ==========================================
@@ -288,33 +581,60 @@ async def admin_manage_plans_menu(callback: types.CallbackQuery):
 
 @router.callback_query(F.data == "admin_add_plan_sel_srv")
 async def add_plan_select_server(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.from_user: return
-    vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    if not vendor: return
+    if not callback.from_user:
+        await callback.answer()
+        return
 
-    stmt = select(Server).where(Server.is_active == True, or_(Server.vendor_id == vendor.id, Server.is_shared == True))
+    vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 سرورهای قابل دسترس برای این فروشنده (فعال):
+    #   a) مستقیماً متعلق به فروشنده است (Server.vendor_id == vendor.id)
+    #   b) از طریق جدول VendorServer با او اشتراک داده شده است
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
+    stmt = select(Server).where(
+        Server.is_active == True,
+        or_(
+            Server.vendor_id == vendor.id,
+            Server.id.in_(shared_subq),
+        ),
+    )
     servers = (await db_session.execute(stmt)).scalars().all()
 
     if not servers:
         await callback.answer("❌ هیچ سرور فعالی برای اتصال پلن وجود ندارد! ابتدا یک سرور اضافه کنید.", show_alert=True)
         return
 
-    kb = []
+    kb: list[list[InlineKeyboardButton]] = []
     for srv in servers:
-        type_str = "اشتراکی" if srv.is_shared else "اختصاصی"
-        kb.append([InlineKeyboardButton(text=f"🖥 {srv.name} ({type_str})", callback_data=f"addp_s_{srv.id}")])
+        # 🌟 نوع دسترسی را بر اساس مالکیت نمایش میدهیم
+        ownership = "مالک" if srv.vendor_id == vendor.id else "اشتراکی"
+        kb.append([InlineKeyboardButton(text=f"🖥 {srv.name} ({ownership})", callback_data=f"addp_s_{srv.id}")])
 
     kb.append([InlineKeyboardButton(text="❌ لغو", callback_data="admin_manage_plans")])
 
     if isinstance(callback.message, types.Message):
-        await callback.message.edit_text("🔗 <b>مرحله ۱: انتخاب سرور</b>\n\nاین پلن قرار است روی کدام سرور ساخته شود؟", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await callback.message.edit_text(
+            "🔗 <b>مرحله ۱: انتخاب سرور</b>\n\nاین پلن قرار است روی کدام سرور ساخته شود؟",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("addp_s_"))
 async def plan_title_start(callback: types.CallbackQuery, state: FSMContext):
-    if not callback.data: return
-    srv_id = int(callback.data.replace("addp_s_", ""))
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    srv_id_str = callback.data.replace("addp_s_", "")
+    if not srv_id_str.isdigit():
+        await callback.answer("❌ شناسه سرور نامعتبر است.", show_alert=True)
+        return
+
+    srv_id = int(srv_id_str)
     await state.update_data(server_id=srv_id)
 
     if isinstance(callback.message, types.Message):
@@ -481,27 +801,55 @@ async def admin_show_plan_details(callback: types.CallbackQuery, db_session: Asy
 
 @router.callback_query(F.data.startswith("adm_tog_"))
 async def admin_toggle_plan(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
-    plan_id = int(callback.data.replace("adm_tog_", ""))
+    if not callback.data:
+        await callback.answer()
+        return
+
+    plan_id_str = callback.data.replace("adm_tog_", "")
+    if not plan_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+
+    plan_id = int(plan_id_str)
     plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
-    if plan:
-        plan.is_active = not plan.is_active
-        await db_session.commit()
-        callback.data = f"adm_p_{plan.id}"
-        await admin_show_plan_details(callback, db_session)
+    if not plan:
+        await callback.answer("❌ پلن یافت نشد.", show_alert=True)
+        return
+
+    plan.is_active = not plan.is_active
+    await db_session.commit()
+
+    # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
+    new_callback = callback.model_copy(update={"data": f"adm_p_{plan.id}"})
+    await admin_show_plan_details(new_callback, db_session)
+
 
 @router.callback_query(F.data.startswith("adm_del_"))
 async def admin_delete_plan(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
-    plan_id = int(callback.data.replace("adm_del_", ""))
+    if not callback.data:
+        await callback.answer()
+        return
+
+    plan_id_str = callback.data.replace("adm_del_", "")
+    if not plan_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+
+    plan_id = int(plan_id_str)
     plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
-    if plan:
-        srv_id = plan.server_id
-        await db_session.delete(plan)
-        await db_session.commit()
-        await callback.answer("✅ حذف شد.", show_alert=True)
-        callback.data = f"adm_cat_{srv_id}"
-        await admin_view_plans_in_server(callback, db_session)
+    if not plan:
+        await callback.answer("❌ پلن یافت نشد.", show_alert=True)
+        return
+
+    srv_id = plan.server_id
+    await db_session.delete(plan)
+    await db_session.commit()
+
+    await callback.answer("✅ حذف شد.", show_alert=True)
+
+    # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
+    new_callback = callback.model_copy(update={"data": f"adm_cat_{srv_id}"})
+    await admin_view_plans_in_server(new_callback, db_session)
 
 @router.callback_query(F.data.startswith("adm_edp_"))
 async def admin_edit_price(callback: types.CallbackQuery, state: FSMContext):
