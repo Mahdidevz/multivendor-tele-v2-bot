@@ -48,3 +48,24 @@ class AddPlanStates(StatesGroup):
 
 class EditPlanStates(StatesGroup):
     waiting_for_new_price = State()
+
+
+# 🌟 [جدید] وضعیتهای مربوط به تخفیف و خرید کاربر
+class PurchaseStates(StatesGroup):
+    waiting_for_discount_code = State()
+
+
+# 🌟 [جدید] وضعیتهای مدیریت کدهای تخفیف توسط ادمین
+class AdminDiscountStates(StatesGroup):
+    waiting_for_discount_code = State()
+    waiting_for_discount_percent = State()
+
+
+# 🌟 [جدید] وضعیتهای تنظیمات ریدایرکت فروشنده و مدیریت شرکا
+class AdminRedirectStates(StatesGroup):
+    waiting_for_redirect_target_id = State()
+
+
+class AdminPartnerStates(StatesGroup):
+    waiting_for_partner_telegram_id = State()
+    waiting_for_partner_name = State()

@@ -1,7 +1,11 @@
 from datetime import datetime
-from sqlalchemy import String, Boolean, ForeignKey, DateTime, BigInteger, Float, Integer
+from sqlalchemy import String, Boolean, ForeignKey, DateTime, BigInteger, Float, Integer, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
+
+# 🌟 [جدید] یادآوری: پس از تغییرات این فایل، حتماً ماگریشن Alembic بسازید:
+#   alembic revision --autogenerate -m "add_discount_redirect_partner_fields"
+#   alembic upgrade head
 
 class Base(DeclarativeBase):
     pass
@@ -16,13 +20,14 @@ class Vendor(Base):
     wallet_address: Mapped[str] = mapped_column(String(100), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     redirect_to_id: Mapped[int] = mapped_column(ForeignKey('vendors.id', ondelete='SET NULL'), nullable=True)
+    # 🌟 [جدید] ریدایرکت جامع فروش/پشتیبانی: تراکنشها و تیکتها به این فروشنده منتقل میشوند
+    redirect_target_id: Mapped[int | None] = mapped_column(ForeignKey('vendors.id', ondelete='SET NULL'), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # روابط
     users = relationship("User", back_populates="vendor")
     vendor_servers = relationship("VendorServer", back_populates="vendor")
-    transactions = relationship("Transaction", back_populates="vendor")
-    redirect_to = relationship("Vendor", remote_side=[id], backref="redirects_received")
+    redirect_to = relationship("Vendor", remote_side=[id], foreign_keys=[redirect_to_id], backref="redirects_received")
     plans = relationship("Plan", back_populates="vendor", cascade="all, delete-orphan")
 
     # 🌟 [جدید] رابطه: هر فروشنده میتواند سرورهای اختصاصی خودش را داشته باشد
@@ -33,6 +38,21 @@ class Vendor(Base):
 
     # 🌟 [جدید] رابطه: کانالهای عضویت اجباری این فروشنده
     force_join_channels = relationship("ForceJoinChannel", back_populates="vendor", cascade="all, delete-orphan")
+
+    # 🌟 [جدید] رابطه: کدهای تخفیف این فروشنده
+    discount_codes = relationship("DiscountCode", back_populates="vendor", cascade="all, delete-orphan")
+
+    # 🌟 [جدید] رابطه: تراکنشهایی که از این فروشنده سرچشمه گرفتهاند (ریدایرکت)
+    transactions = relationship(
+        "Transaction",
+        back_populates="vendor",
+        foreign_keys="[Transaction.vendor_id]",
+    )
+    origin_transactions = relationship(
+        "Transaction",
+        back_populates="origin_vendor",
+        foreign_keys="[Transaction.origin_vendor_id]",
+    )
 
 
 class Server(Base):
@@ -128,15 +148,41 @@ class Transaction(Base):
     server_id: Mapped[int] = mapped_column(ForeignKey('servers.id', ondelete='SET NULL'), nullable=True)
     plan_id: Mapped[int] = mapped_column(ForeignKey('plans.id', ondelete='SET NULL'), nullable=True)
     amount: Mapped[float] = mapped_column(Float)
+    # 🌟 [جدید] فیلدهای تخفیف و ریدایرکت برای حسابداری دقیق
+    discount_percent: Mapped[int] = mapped_column(Integer, default=0)
+    original_amount: Mapped[int] = mapped_column(Integer, default=0)
+    # 🌟 [جدید] ارجاع به کد تخفیف استفادهشده (SET NULL تا سابقه مالی پس از حذف کد حفظ شود)
+    discount_code_id: Mapped[int | None] = mapped_column(ForeignKey('discount_codes.id', ondelete="SET NULL"), nullable=True)
+    origin_vendor_id: Mapped[int | None] = mapped_column(ForeignKey('vendors.id', ondelete='SET NULL'), nullable=True)
     receipt_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     destination_card: Mapped[str] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     user = relationship("User", back_populates="transactions")
-    vendor = relationship("Vendor", back_populates="transactions")
+    vendor = relationship("Vendor", back_populates="transactions", foreign_keys=[vendor_id])
+    # 🌟 [جدید] فروشندهای که کاربر در اصل متعلق به او بوده (قبل از ریدایرکت)
+    origin_vendor = relationship("Vendor", back_populates="origin_transactions", foreign_keys=[origin_vendor_id])
+    # 🌟 [جدید] کد تخفیف مرتبط (در صورت حذف کد، این فیلد NULL میشود اما سابقه مالی حفظ میگردد)
+    discount_code = relationship("DiscountCode")
     server = relationship("Server", back_populates="transactions")
     plan = relationship("Plan", back_populates="transactions")
+
+
+# 🌟 [جدید] مدل کدهای تخفیف هر فروشنده
+class DiscountCode(Base):
+    """کد تخفیف قابل استفاده توسط کاربران هنگام خرید پلن."""
+    __tablename__ = 'discount_codes'
+    __table_args__ = (UniqueConstraint('vendor_id', 'code', name='uq_discount_vendor_code'),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vendor_id: Mapped[int] = mapped_column(ForeignKey('vendors.id', ondelete='CASCADE'))
+    code: Mapped[str] = mapped_column(String(50))
+    discount_percent: Mapped[int] = mapped_column(Integer, default=0)  # ۱ تا ۱۰۰
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    vendor = relationship("Vendor", back_populates="discount_codes")
 
 
 class Ticket(Base):

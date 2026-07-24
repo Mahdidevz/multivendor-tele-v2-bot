@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 import qrcode
 from aiogram import F, Router, types
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -17,9 +18,9 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import BUTTONS, MESSAGES
-from bot.states import WalletChargeStates, UserStates
+from bot.states import WalletChargeStates, UserStates, PurchaseStates
 from core.database.crud import get_or_create_user
-from core.database.models import Transaction, User, Vendor, Plan, Server, Ticket, ForceJoinChannel, VendorServer
+from core.database.models import Transaction, User, Vendor, Plan, Server, Ticket, ForceJoinChannel, VendorServer, DiscountCode
 from core.services.panel_client import MarzbanClient
 
 logger = logging.getLogger(__name__)
@@ -34,9 +35,30 @@ async def cmd_start(message: types.Message, db_session: AsyncSession):
     user_id: int = message.from_user.id
     first_name: str = message.from_user.first_name if message.from_user else MESSAGES["default_user"]
 
-    db_user = await get_or_create_user(session=db_session, telegram_id=user_id)
+    # 🌟 [Bug 1 Fix] استخراج payload از دیپلینک (مثلاً /start ref_5)
+    # فقط برای کاربران جدید استفاده میشود؛ کاربران موجود در crud.py پیوند دائمی دارند.
+    deep_link_vendor_id: int | None = None
+    if message.text:
+        # پارس امن متن /start بدون وابستگی به attributeهای جادویی
+        # فرمتها: "/start" یا "/start 5" یا "/start ref_5" یا "/start start_5"
+        text_parts = message.text.split(maxsplit=1)
+        if len(text_parts) > 1:
+            raw_payload = text_parts[1].strip()
+            numeric_part = raw_payload
+            for prefix in ("ref_", "start_", "vendor_"):
+                if numeric_part.startswith(prefix):
+                    numeric_part = numeric_part[len(prefix):]
+                    break
+            if numeric_part.isdigit():
+                deep_link_vendor_id = int(numeric_part)
+
+    db_user = await get_or_create_user(
+        session=db_session,
+        telegram_id=user_id,
+        deep_link_vendor_id=deep_link_vendor_id,
+    )
     if not db_user:
-        await message.answer("🛠 فروشگاه در حال راه‌اندازی است. لطفاً بعداً مراجعه کنید.")
+        await message.answer("🛠 فروشگاه در حال راهاندازی است. لطفاً بعداً مراجعه کنید.")
         return
 
     wallet_balance = db_user.wallet_balance
@@ -191,8 +213,9 @@ async def process_plan_selection(callback: types.CallbackQuery, db_session: Asyn
 
     wallet_balance = user.wallet_balance
     target_vendor = vendor
-    if vendor.redirect_to_id:
-        stmt_target = select(Vendor).where(Vendor.id == vendor.redirect_to_id)
+    # 🌟 [Bug 2 Fix] استفاده از redirect_target_id (فیلد جدید) به جای redirect_to_id
+    if vendor.redirect_target_id:
+        stmt_target = select(Vendor).where(Vendor.id == vendor.redirect_target_id)
         redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
         if redirected_vendor:
             target_vendor = redirected_vendor
@@ -236,9 +259,10 @@ async def process_plan_selection(callback: types.CallbackQuery, db_session: Asyn
     await callback.answer()
 
 
-# --- ۶. صدور پیش‌فاکتور اتوماتیک ---
+# --- ۶. مرحله تخفیف + صدور پیشفاکتور ---
+# 🌟 [جدید] به جای ساخت مستقیم تراکنش، ابتدا مرحله «اعمال کد تخفیف» نمایش داده می‌شود.
 @router.callback_query(F.data.startswith("charge_req_"))
-async def auto_charge_for_plan(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+async def apply_discount_start(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
     if not callback.data or not callback.from_user: return
 
     plan_id_str = callback.data.replace("charge_req_", "")
@@ -247,60 +271,201 @@ async def auto_charge_for_plan(callback: types.CallbackQuery, state: FSMContext,
 
     stmt_plan = select(Plan).where(Plan.id == plan_id)
     plan = (await db_session.execute(stmt_plan)).scalar_one_or_none()
-    if not plan: return
+    if not plan:
+        await callback.answer("❌ پلن یافت نشد.", show_alert=True)
+        return
 
     stmt = select(User, Vendor).join(Vendor, User.vendor_id == Vendor.id).where(User.telegram_id == callback.from_user.id)
     row = (await db_session.execute(stmt)).first()
     if not row: return
     user_row, vendor_row = row
 
-    needed_amount = plan.price - user_row.wallet_balance
-    if needed_amount <= 0:
-        await callback.answer("✅ موجودی شما کافی است.", show_alert=True)
+    # ذخیره اطلاعات در FSM برای استفاده در مراحل بعد
+    await state.update_data(
+        plan_id=plan.id,
+        user_id=user_row.id,
+        vendor_id=vendor_row.id,
+        original_price=int(plan.price),
+    )
+
+    text = (
+        "🎁 <b>کد تخفیف</b>\n\n"
+        f"💵 قیمت پلن: <code>{int(plan.price):,}</code> تومان\n\n"
+        "اگر کد تخفیف دارید، آن را ارسال کنید.\n"
+        "در غیر این صورت روی دکمه زیر کلیک کنید."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ ادامه بدون تخفیف", callback_data="skip_discount")],
+        [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")],
+    ])
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text, reply_markup=kb)
+
+    await state.set_state(PurchaseStates.waiting_for_discount_code)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "skip_discount", PurchaseStates.waiting_for_discount_code)
+async def skip_discount(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    data = await state.get_data()
+    original_price = int(data.get("original_price") or 0)
+    if isinstance(callback.message, types.Message):
+        await _create_purchase_invoice(callback.message, state, db_session, 0, original_price)
+    await callback.answer()
+
+
+@router.message(PurchaseStates.waiting_for_discount_code)
+async def process_discount_code(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
         return
 
-    target_vendor = vendor_row
-    if vendor_row.redirect_to_id:
-        stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_to_id)
-        redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
-        if redirected_vendor: target_vendor = redirected_vendor
+    data = await state.get_data()
+    plan_id = data.get("plan_id")
+    vendor_id = data.get("vendor_id")
+    user_id_db = data.get("user_id")
+    original_price = int(data.get("original_price") or 0)
+
+    if not plan_id or not vendor_id or not user_id_db:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        return
+
+    code = message.text.strip()
+    dc = (await db_session.execute(
+        select(DiscountCode).where(
+            DiscountCode.vendor_id == int(vendor_id),
+            DiscountCode.code == code,
+            DiscountCode.is_active == True,
+        )
+    )).scalar_one_or_none()
+
+    if not dc:
+        await message.answer(
+            "❌ کد تخفیف نامعتبر یا منقضی است.\n"
+            "لطفاً کد صحیح وارد کنید یا روی «ادامه بدون تخفیف» کلیک کنید."
+        )
+        return
+
+    # 🌟 [جدید] بررسی تکبارگی استفاده به ازای هر کاربر:
+    # اگر کاربر قبلاً این کد را در یک تراکنش pending یا approved استفاده کرده باشد، ممنوع میشود.
+    # نکته: اگر ادمین تراکنش قبلی را reject کند (status == "rejected")، کاربر مجدداً میتواند از کد استفاده کند.
+    existing_usage = await db_session.scalar(
+        select(Transaction).where(
+            Transaction.user_id == int(user_id_db),
+            Transaction.discount_code_id == dc.id,
+            Transaction.status.in_(["pending", "approved"]),
+        )
+    )
+    if existing_usage is not None:
+        await message.answer("❌ شما قبلاً از این کد تخفیف استفاده کرده‌اید.")
+        return
+
+    discount_percent = int(dc.discount_percent)
+    discount_amount = original_price * discount_percent // 100
+    final_price = original_price - discount_amount
+
+    # 🌟 ذخیره discount_code_id در FSM تا هنگام ساخت تراکنش درج شود
+    await state.update_data(
+        discount_percent=discount_percent,
+        final_price=final_price,
+        discount_code_id=dc.id,
+    )
+    await _create_purchase_invoice(message, state, db_session, discount_percent, final_price)
+
+
+async def _create_purchase_invoice(
+    message: types.Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    discount_percent: int,
+    final_price: int,
+) -> None:
+    """ساخت تراکنش و نمایش فاکتور پرداخت برای کاربر."""
+    data = await state.get_data()
+    plan_id = data.get("plan_id")
+    user_id_db = data.get("user_id")
+    vendor_id = data.get("vendor_id")
+    original_price = int(data.get("original_price") or 0)
+    discount_code_id = data.get("discount_code_id")  # 🌟 [جدید] ممکن است None باشد (بدون تخفیف)
+
+    if not plan_id or not user_id_db or not vendor_id:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        return
+
+    plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
+    if not plan:
+        await message.answer("❌ پلن یافت نشد.")
+        await state.clear()
+        return
+
+    # واکشی فروشنده و فروشنده هدف (ریدایرکت)
+    vendor = (await db_session.execute(select(Vendor).where(Vendor.id == int(vendor_id)))).scalar_one_or_none()
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
+
+    target_vendor = vendor
+    target_vendor_id = vendor.id
+    if vendor.redirect_target_id:
+        redirected = (await db_session.execute(select(Vendor).where(Vendor.id == vendor.redirect_target_id))).scalar_one_or_none()
+        if redirected:
+            target_vendor = redirected
+            target_vendor_id = redirected.id
 
     if not target_vendor.card_number:
-        await callback.answer("❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است.", show_alert=True)
+        await message.answer("❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است.")
+        await state.clear()
         return
 
     random_fee = random.randint(1, 900)
-    final_amount = int(needed_amount) + random_fee
+    amount_with_fee = final_price + random_fee
 
+    # 🌟 ساخت تراکنش با فیلدهای تخفیف و ریدایرکت
     new_tx = Transaction(
-        user_id=user_row.id,
-        vendor_id=vendor_row.id,
-        amount=final_amount,
+        user_id=int(user_id_db),
+        vendor_id=target_vendor_id,                                          # فروشنده هدف (مدیرکننده)
+        origin_vendor_id=vendor.id if target_vendor_id != vendor.id else None,  # منشأ در صورت ریدایرکت
+        plan_id=plan.id,
+        amount=amount_with_fee,                                                # مبلغ نهایی پرداختی
+        original_amount=original_price,                                        # قیمت اصلی پلن
+        discount_percent=discount_percent,                                     # درصد تخفیف
+        discount_code_id=int(discount_code_id) if discount_code_id else None,  # 🌟 [جدید] ارجاع به کد تخفیف
         destination_card=target_vendor.card_number,
         status="pending",
-        plan_id=plan.id
     )
     db_session.add(new_tx)
     await db_session.commit()
     await db_session.refresh(new_tx)
-
     await state.update_data(transaction_id=new_tx.id)
 
+    # ساخت متن فاکتور
+    discount_line = ""
+    if discount_percent > 0:
+        discount_amount = original_price - final_price
+        discount_line = f"🎯 تخفیف ({discount_percent}%): <code>-{discount_amount:,}</code> تومان\n"
+
     text = (
-        f"🧾 <b>فاکتور خرید سریع پلن ({plan.title})</b>\n\n"
+        f"🧾 <b>فاکتور خرید ({plan.title})</b>\n\n"
+        f"💵 قیمت اصلی: <code>{original_price:,}</code> تومان\n"
+        f"{discount_line}"
+        f"💰 مبلغ نهایی: <code>{final_price:,}</code> تومان\n\n"
         f"💳 لطفاً مبلغ زیر را به شماره کارت <b>{target_vendor.name}</b> واریز کنید:\n"
         f"<code>{target_vendor.card_number}</code>\n\n"
-        f"💵 <b>مبلغ دقیق واریز:</b> <code>{final_amount:,}</code> تومان\n\n"
+        f"💵 <b>مبلغ دقیق واریز:</b> <code>{amount_with_fee:,}</code> تومان\n\n"
         f"⚠️ مبلغ {random_fee} تومان جهت شناسایی سیستمی اضافه شده است.\n"
         "📸 پس از واریز، عکس رسید را همینجا بفرستید تا کانفیگ صادر شود:"
     )
 
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]])
-    if isinstance(callback.message, types.Message):
-        await callback.message.edit_text(text, reply_markup=cancel_kb)
-
+    await message.answer(text, reply_markup=cancel_kb)
     await state.set_state(WalletChargeStates.waiting_for_receipt)
-    await callback.answer()
+
 
 
 # --- ۷. دریافت عکس و ارسال به پی‌وی ادمین ---
@@ -337,8 +502,9 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
     await db_session.commit()
 
     admin_tg_id = vendor.telegram_id
-    if vendor.redirect_to_id:
-        stmt_redirect = select(Vendor).where(Vendor.id == vendor.redirect_to_id)
+    # 🌟 [Bug 2 Fix] استفاده از redirect_target_id برای هدایت فیش به فروشنده هدف
+    if vendor.redirect_target_id:
+        stmt_redirect = select(Vendor).where(Vendor.id == vendor.redirect_target_id)
         target = (await db_session.execute(stmt_redirect)).scalar_one_or_none()
         if target: admin_tg_id = target.telegram_id
 
@@ -358,9 +524,14 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
     caption = (
         f"🧾 <b>فیش واریزی جدید</b>\n\n"
         f"👤 آیدی کاربر: <code>{message.from_user.id}</code>\n"
-        f"💰 مبلغ واریز: <code>{transaction.amount:,}</code> تومان\n"
-        f"📌 بابت: <b>{plan_text}</b>"
+        f"💰 مبلغ واریز: <code>{int(transaction.amount):,}</code> تومان\n"
     )
+    # 🌟 نمایش اطلاعات تخفیف در صورت وجود
+    if transaction.discount_percent and transaction.discount_percent > 0:
+        caption += (
+            f"🎯 تخفیف ({transaction.discount_percent}%): <code>{int(transaction.original_amount):,}</code> ← <code>{int(transaction.amount):,}</code> تومان\n"
+        )
+    caption += f"📌 بابت: <b>{plan_text}</b>"
 
     try:
         # 🌟 ارسال به پی‌وی ادمین به صورت امن
@@ -390,8 +561,9 @@ async def ask_charge_amount(callback: types.CallbackQuery, state: FSMContext, db
 
     _, vendor_row = row
     target_vendor = vendor_row
-    if vendor_row.redirect_to_id:
-        stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_to_id)
+    # 🌟 [Bug 2 Fix] استفاده از redirect_target_id در هندلر شارژ کیف پول
+    if vendor_row.redirect_target_id:
+        stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_target_id)
         redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
         if redirected_vendor: target_vendor = redirected_vendor
 
@@ -431,8 +603,9 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
     user_row, vendor_row = row
 
     target_vendor = vendor_row
-    if vendor_row.redirect_to_id:
-        stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_to_id)
+    # 🌟 [Bug 2 Fix] استفاده از redirect_target_id در هندلر پردازش مبلغ شارژ
+    if vendor_row.redirect_target_id:
+        stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_target_id)
         redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
         if redirected_vendor: target_vendor = redirected_vendor
 
@@ -445,9 +618,18 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
     random_fee = random.randint(1, 900)
     final_amount = base_amount + random_fee
 
+    # 🌟 [Bug 4 Fix] حسابداری ریدایرکت در شارژ کیف پول: مثل _create_purchase_invoice
+    # vendor_id = فروشنده هدف (مدیرکننده پول/پشتیبانی)
+    # origin_vendor_id = فروشنده اصلی کاربر (اگر ریدایرکت شده)
+    target_vendor_id = target_vendor.id
+    origin_vendor_id: int | None = None
+    if target_vendor_id != vendor_row.id:
+        origin_vendor_id = vendor_row.id
+
     new_tx = Transaction(
         user_id=user_row.id,
-        vendor_id=vendor_row.id,
+        vendor_id=target_vendor_id,
+        origin_vendor_id=origin_vendor_id,
         amount=final_amount,
         destination_card=target_vendor.card_number,
         status="pending"
@@ -533,8 +715,19 @@ async def process_support(callback: types.CallbackQuery, state: FSMContext, db_s
         await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
         return
 
-    # ذخیره user_id و vendor_id برای استفاده در هندلر بعدی
-    await state.update_data(ticket_user_id=user.id, ticket_vendor_id=user.vendor_id)
+    # 🌟 [Bug 2 Fix] تیکت پشتیبانی هم باید به redirect_target_id برود
+    # کاربر به طور دائمی به user.vendor_id پیوند خورده، اما تیکت ممکن است به فروشنده هدف ریدایرکت شود.
+    stmt_vendor = select(Vendor).where(Vendor.id == user.vendor_id)
+    vendor_row = (await db_session.execute(stmt_vendor)).scalar_one_or_none()
+    final_vendor_id: int = user.vendor_id
+    if vendor_row and vendor_row.redirect_target_id:
+        stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_target_id)
+        target_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
+        if target_vendor:
+            final_vendor_id = target_vendor.id
+
+    # ذخیره user_id و vendor_id نهایی (با درنظرگرفتن ریدایرکت) برای استفاده در هندلر بعدی
+    await state.update_data(ticket_user_id=user.id, ticket_vendor_id=final_vendor_id)
 
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ انصراف", callback_data="back_to_main")]
@@ -777,7 +970,7 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
 # 🎁 [جدید] دریافت تست رایگان + Force-Join
 # ==========================================
 
-# --- مرحله ۱: بررسی عضویت اجباری در کانالها ---
+# --- مرحله ۱: ورود به تست رایگان (فقط رندر کانالها) ---
 @router.callback_query(F.data == "free_test_start")
 async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSession):
     # گاردهای ایمنی نوع
@@ -796,16 +989,16 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
     stmt_channels = select(ForceJoinChannel).where(ForceJoinChannel.vendor_id == user.vendor_id)
     channels = (await db_session.execute(stmt_channels)).scalars().all()
 
-    # گارد روی bot (در تایپ aiogram ممکن است None باشد)
-    bot = callback.bot
-    if bot is None:
-        await callback.answer("❌ خطای داخلی رخ داده است.", show_alert=True)
-        return
-
     # اگر کانالی تعریف نشده → مستقیم به مرحله ۲ (نمایش سرورها)
     if not channels:
         new_callback = callback.model_copy(update={"data": "free_test_servers"})
         await free_test_show_servers(new_callback, db_session)
+        return
+
+    # گارد روی bot
+    bot = callback.bot
+    if bot is None:
+        await callback.answer("❌ خطای داخلی رخ داده است.", show_alert=True)
         return
 
     # بررسی عضویت کاربر در هر کانال
@@ -813,11 +1006,80 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
     for ch in channels:
         try:
             member = await bot.get_chat_member(chat_id=ch.chat_id, user_id=user.telegram_id)
-            status = member.status
-            if status not in ("member", "administrator", "creator"):
+            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+                unjoined.append(ch)
+        except TelegramBadRequest as e:
+            logger.warning(f"Force-join check failed for channel {ch.chat_id} : {e}")
+            unjoined.append(ch)
+        except Exception as e:
+            logger.warning(f"Force-join membership check failed for channel {ch.chat_id}: {e}")
+            unjoined.append(ch)
+
+    # اگر در همه کانالها عضو بود → مستقیم به مرحله ۲
+    if not unjoined:
+        new_callback = callback.model_copy(update={"data": "free_test_servers"})
+        await free_test_show_servers(new_callback, db_session)
+        return
+
+    # 🌟 ورود اولیه: فقط کیبورد کانالها را رندر کن. هیچ هشدار پاپآپی نده.
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for ch in unjoined:
+        kb_rows.append([InlineKeyboardButton(text=ch.title, url=ch.url)])
+    kb_rows.append([InlineKeyboardButton(text="✅ بررسی مجدد عضویت", callback_data="free_test_verify")])
+    new_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    text = "🔒 برای دریافت تست رایگان، ابتدا در کانالهای زیر عضو شوید:"
+
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=new_kb)
+        except TelegramBadRequest:
+            # محتوای تکراری → بیخیال ویرایش شو ولی پاپآپ هم نده (ورود اولیه است)
+            pass
+
+    await callback.answer()
+
+
+# --- مرحله ۱.۵: بررسی مجدد عضویت (فقط هنگام کلیک روی دکمه «بررسی مجدد») ---
+@router.callback_query(F.data == "free_test_verify")
+async def free_test_verify(callback: types.CallbackQuery, db_session: AsyncSession):
+    # گاردهای ایمنی نوع
+    if not callback.from_user or not callback.data:
+        await callback.answer()
+        return
+
+    # واکشی کاربر
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # واکشی کانالهای عضویت اجباری این فروشنده
+    stmt_channels = select(ForceJoinChannel).where(ForceJoinChannel.vendor_id == user.vendor_id)
+    channels = (await db_session.execute(stmt_channels)).scalars().all()
+
+    # اگر کانالی تعریف نشده → مستقیم به مرحله ۲
+    if not channels:
+        new_callback = callback.model_copy(update={"data": "free_test_servers"})
+        await free_test_show_servers(new_callback, db_session)
+        return
+
+    # گارد روی bot
+    bot = callback.bot
+    if bot is None:
+        await callback.answer("❌ خطای داخلی رخ داده است.", show_alert=True)
+        return
+
+    # بررسی مجدد عضویت کاربر در هر کانال
+    unjoined: list[ForceJoinChannel] = []
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch.chat_id, user_id=user.telegram_id)
+            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
                 unjoined.append(ch)
         except TelegramBadRequest:
-            # بات اخراج شده/ادمین نیست → محتاطانه «عضو نیست»
+            logger.warning(f"Force-join check failed for channel {ch.chat_id}")
             unjoined.append(ch)
         except Exception as e:
             logger.warning(f"Force-join membership check failed for channel {ch.chat_id}: {e}")
@@ -829,21 +1091,9 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
         await free_test_show_servers(new_callback, db_session)
         return
 
-    # نمایش لیست کانالهای عضو نشده + دکمه بررسی مجدد
-    kb_rows: list[list[InlineKeyboardButton]] = []
-    for ch in unjoined:
-        kb_rows.append([InlineKeyboardButton(text=ch.title, url=ch.url)])
-    kb_rows.append([InlineKeyboardButton(text="✅ بررسی مجدد عضویت", callback_data="free_test_start")])
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-
-    text = "🔒 برای دریافت تست رایگان، ابتدا در کانالهای زیر عضو شوید:"
-    if isinstance(callback.message, types.Message):
-        try:
-            await callback.message.edit_text(text=text, reply_markup=kb)
-        except TelegramBadRequest:
-            pass
-
-    await callback.answer()
+    # هنوز در همه کانالها عضو نشده → فقط پاپآپ هشدار بده و return.
+    # کیبورد از قبل رندر شده، نیازی به ویرایش مجدد نیست.
+    await callback.answer("❌ شما هنوز در تمام کانالها عضو نشدهاید!", show_alert=True)
 
 
 # --- مرحله ۲: بررسی واجلبودن + نمایش لیست سرورها ---

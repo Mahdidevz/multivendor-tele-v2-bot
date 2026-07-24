@@ -16,8 +16,8 @@ from sqlalchemy import select, or_, update, func
 from sqlalchemy.orm import selectinload
 from aiogram.fsm.context import FSMContext
 
-from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates, AdminTicketStates, AdminCustomerStates, AdminForceJoinStates
-from core.database.models import Plan, Vendor, Transaction, Server, VendorServer, Ticket, ForceJoinChannel, User
+from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates, AdminTicketStates, AdminCustomerStates, AdminForceJoinStates, AdminDiscountStates, AdminRedirectStates, AdminPartnerStates
+from core.database.models import Plan, Vendor, Transaction, Server, VendorServer, Ticket, ForceJoinChannel, User, DiscountCode
 from core.services.panel_client import MarzbanClient
 
 logger = logging.getLogger(__name__)
@@ -66,33 +66,37 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
             InlineKeyboardButton(text=receipts_label, callback_data="admin_receipts")
         ],
         [
-            InlineKeyboardButton(text="🔄 تنظیمات ریدایرکت", callback_data="admin_redirect"),
-            InlineKeyboardButton(text="⚙️ اطلاعات پرداخت من", callback_data="admin_payment_info")
+            InlineKeyboardButton(text="🎁 کدهای تخفیف", callback_data="admin_discounts"),
+            InlineKeyboardButton(text="🔄 تنظیمات ریدایرکت", callback_data="admin_redirect")
         ],
         [
-            InlineKeyboardButton(text="📊 گزارش مالی", callback_data="admin_reports"),
-            InlineKeyboardButton(text="🖥 مدیریت سرورها", callback_data="admin_view_servers")
+            InlineKeyboardButton(text="⚙️ اطلاعات پرداخت من", callback_data="admin_payment_info"),
+            InlineKeyboardButton(text="📊 گزارش مالی", callback_data="admin_reports")
         ],
         [
-            InlineKeyboardButton(text="🛍 مدیریت پلنها", callback_data="admin_manage_plans"),
-            InlineKeyboardButton(text=tickets_label, callback_data="admin_support_tickets")
+            InlineKeyboardButton(text="🖥 مدیریت سرورها", callback_data="admin_view_servers"),
+            InlineKeyboardButton(text="🛍 مدیریت پلنها", callback_data="admin_manage_plans")
         ],
         [
-            InlineKeyboardButton(text="👥 مشتریان من", callback_data="admin_my_customers"),
+            InlineKeyboardButton(text=tickets_label, callback_data="admin_support_tickets"),
+        ],
+        [
+            InlineKeyboardButton(text="👥 مدیریت مشتریان", callback_data="admin_my_customers"),
             InlineKeyboardButton(text="🔒 عضویت اجباری", callback_data="admin_force_join"),
         ],
     ]
 
     if is_owner:
         kb.append([
-            InlineKeyboardButton(text="👑 مدیریت کل شرکا", callback_data="owner_manage_vendors")
+            InlineKeyboardButton(text="👑 مدیریت شرکا", callback_data="owner_manage_vendors")
         ])
 
     kb.append([InlineKeyboardButton(text="🔙 بستن پنل", callback_data="close_admin_panel")])
     reply_markup = InlineKeyboardMarkup(inline_keyboard=kb)
 
     status_text = "🟢 فعال" if vendor.is_active else "🔴 غیرفعال"
-    redirect_text = "ندارد" if not vendor.redirect_to_id else "روشن 🔄"
+    # 🌟 [Bug 2 Fix] استفاده از redirect_target_id برای نمایش وضعیت ریدایرکت
+    redirect_text = "ندارد" if not vendor.redirect_target_id else "روشن 🔄"
 
     text = (
         f"👨‍💼 <b>پنل مدیریت شرکا</b>\n\n"
@@ -256,7 +260,15 @@ async def admin_receipt_detail(callback: types.CallbackQuery, db_session: AsyncS
     caption = (
         f"🧾 <b>بررسی فیش</b>\n\n"
         f"👤 <b>کاربر:</b> <code>{user.telegram_id}</code>\n"
-        f"💰 <b>مبلغ:</b> <code>{int(tx.amount):,}</code> تومان\n"
+        f"💰 <b>مبلغ نهایی:</b> <code>{int(tx.amount):,}</code> تومان\n"
+    )
+    # 🌟 نمایش اطلاعات تخفیف در صورت وجود
+    if tx.discount_percent and tx.discount_percent > 0:
+        caption += (
+            f"💵 <b>قیمت اصلی:</b> <code>{int(tx.original_amount):,}</code> تومان\n"
+            f"🎯 <b>تخفیف ({tx.discount_percent}%):</b> <code>{int(tx.original_amount - int(tx.amount)):,}</code> تومان\n"
+        )
+    caption += (
         f"📌 <b>بابت:</b> {plan_text}\n"
         f"🕒 <b>زمان:</b> {tx.created_at.strftime('%Y-%m-%d %H:%M')}\n"
     )
@@ -1209,6 +1221,16 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
         msg_to_user = (
             f"✅ <b>پرداخت شما تایید شد!</b>\n\n"
             f"🛍 <b>سرویس:</b> {plan.title}\n"
+        )
+        # 🌟 نمایش اطلاعات تخفیف در صورت وجود
+        if tx.discount_percent and tx.discount_percent > 0:
+            msg_to_user += (
+                f"💵 قیمت اصلی: <code>{int(tx.original_amount):,}</code> تومان\n"
+                f"🎯 تخفیف ({tx.discount_percent}%): <code>{int(tx.amount):,}</code> تومان\n"
+            )
+        else:
+            msg_to_user += f"💵 مبلغ: <code>{int(tx.amount):,}</code> تومان\n"
+        msg_to_user += (
             f"🔗 <b>لینک اشتراک شما:</b>\n<code>{sub_url}</code>\n\n"
             f"💡 آموزش اتصال: ابتدا لینک بالا را کپی کرده و در نرمافزار خود وارد کنید."
         )
@@ -1590,8 +1612,12 @@ async def admin_force_join_add(callback: types.CallbackQuery, state: FSMContext)
     text = (
         "➕ <b>افزودن کانال جدید</b>\n\n"
         "لطفاً اطلاعات کانال را با این فرمت ارسال کنید:\n\n"
-        "<code>@channel_id - https://t.me/... - عنوان کانال</code>\n\n"
-        "⚠️ توجه: ربات باید مدیر (Admin) در آن کانال باشد تا بتواند عضویت کاربران را بررسی کند."
+        "<code>chat_id - https://t.me/... - عنوان کانال</code>\n\n"
+        "💡 <b>chat_id</b> میتواند یکی از دو فرمت زیر باشد:\n"
+        "• کانال عمومی: <code>@mychannel</code>\n"
+        "• کانال خصوصی: <code>-1001234567890</code>\n\n"
+        "⚠️ توجه: ربات باید مدیر (Admin) در آن کانال باشد تا بتواند عضویت کاربران را بررسی کند.\n"
+        "برای دریافت chat_id کانال خصوصی، میتوانید از رباتهای @username_to_id_api_bot استفاده کنید."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="❌ لغو", callback_data="admin_force_join")
@@ -1609,10 +1635,13 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
     if not message.text or not message.from_user:
         return
 
+    # 🌟 [Bug 3 Fix] فرمت منعطف: «chat_id - url - title»
+    # chat_id میتواند عمومی (@channel) یا خصوصی (-100...) باشد.
     parts = message.text.split(" - ")
     if len(parts) != 3:
         await message.answer(
-            "❌ فرمت نامعتبر. مثال صحیح:\n<code>@channel - https://t.me/... - عنوان</code>"
+            "❌ فرمت نامعتبر. مثال صحیح:\n<code>-1001234567890 - https://t.me/... - عنوان</code>\n"
+            "یا\n<code>@channel - https://t.me/... - عنوان</code>"
         )
         return
 
@@ -1620,9 +1649,44 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
     url = parts[1].strip()
     title = parts[2].strip()
 
-    if not chat_id or not url.startswith("http"):
+    # اعتبارسنجی فرمت chat_id: باید با @ (عمومی) یا -100 (خصوصی) شروع شود
+    is_public_handle = chat_id.startswith("@") and len(chat_id) > 1
+    is_private_id = chat_id.startswith("-100") and chat_id.lstrip("-").isdigit() and len(chat_id) > 4
+    if not is_public_handle and not is_private_id:
         await message.answer(
-            "❌ فرمت نامعتبر. مثال صحیح:\n<code>@channel - https://t.me/... - عنوان</code>"
+            "❌ آیدی کانال نامعتبر است. باید با @ (کانال عمومی) یا -100 (کانال خصوصی) شروع شود.\n"
+            "مثال: <code>-1001234567890</code> یا <code>@mychannel</code>"
+        )
+        return
+
+    if not url.startswith("http"):
+        await message.answer(
+            "❌ لینک کانال نامعتبر است. باید با http شروع شود.\nمثال: <code>https://t.me/mychannel</code>"
+        )
+        return
+
+    if not title:
+        await message.answer("❌ عنوان کانال نمیتواند خالی باشد.")
+        return
+
+    # 🌟 [Bug 3 Fix] بررسی زنده API قبل از ذخیره در دیتابیس
+    bot = message.bot
+    if bot is None:
+        await message.answer("❌ خطای داخلی رخ داد. لطفاً مجدداً تلاش کنید.")
+        return
+
+    try:
+        # تلاش برای گرفتن اطلاعات کانال → تأیید اینکه ربات ادمین است و آیدی صحیح است
+        await bot.get_chat(chat_id=chat_id)
+    except TelegramBadRequest:
+        await message.answer(
+            "❌ ربات نتوانست به کانال متصل شود. بررسی کنید آیدی صحیح است (مثل -100...) و ربات در کانال ادمین است."
+        )
+        return
+    except Exception:
+        # شامل TelegramForbiddenError و سایر خطاها
+        await message.answer(
+            "❌ ربات نتوانست به کانال متصل شود. بررسی کنید آیدی صحیح است (مثل -100...) و ربات در کانال ادمین است."
         )
         return
 
@@ -2196,3 +2260,522 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
         except TelegramBadRequest:
             pass
     await callback.answer("🔄 اطلاعات بروزرسانی شد")
+
+
+# ==========================================
+# 🌟 [جدید] مدیریت کدهای تخفیف
+# ==========================================
+@router.callback_query(F.data == "admin_discounts")
+async def admin_discounts_menu(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    stmt = select(DiscountCode).where(DiscountCode.vendor_id == vendor.id).order_by(DiscountCode.id.desc())
+    codes = (await db_session.execute(stmt)).scalars().all()
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for dc in codes:
+        status = "فعال" if dc.is_active else "غیرفعال"
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"🎁 {dc.code} ({dc.discount_percent}% - {status})",
+                callback_data=f"dc_view_{dc.id}",
+            ),
+            InlineKeyboardButton(
+                text="🗑 حذف",
+                callback_data=f"delete_dc_{dc.id}",
+            ),
+        ])
+    kb_rows.append([InlineKeyboardButton(text="➕ افزودن کد تخفیف", callback_data="dc_add")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    text = (
+        "🎁 <b>مدیریت کدهای تخفیف</b>\n\n"
+        + ("کدهای تخفیف شما:" if codes else "هیچ کد تخفیفی ثبت نشده است.")
+    )
+
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "dc_add")
+async def admin_discount_add_start(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    text = (
+        "➕ <b>افزودن کد تخفیف</b>\n\n"
+        "لطفاً کد تخفیف را ارسال کنید (مثال: SUMMER50):\n"
+        "⚠️ فقط حروف انگلیسی و اعداد، بین ۳ تا ۵۰ کاراکتر."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="admin_discounts")]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await state.set_state(AdminDiscountStates.waiting_for_discount_code)
+    await callback.answer()
+
+
+@router.message(AdminDiscountStates.waiting_for_discount_code)
+async def process_discount_code_input(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    code = message.text.strip()
+    # اعتبارسنجی: فقط حروف/اعداد و طول ۳-۵۰
+    if not (code.isalnum() and 3 <= len(code) <= 50):
+        await message.answer("❌ کد نامعتبر است. فقط حروف انگلیسی و اعداد، بین ۳ تا ۵۰ کاراکتر.")
+        return
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
+
+    # بررسی یکتایی کد برای این فروشنده
+    exists = (
+        await db_session.execute(
+            select(DiscountCode).where(DiscountCode.vendor_id == vendor.id, DiscountCode.code == code)
+        )
+    ).scalar_one_or_none()
+    if exists:
+        await message.answer("❌ این کد قبلاً ثبت شده است. لطفاً کد دیگری وارد کنید.")
+        return
+
+    await state.update_data(discount_code=code, discount_vendor_id=vendor.id)
+    await state.set_state(AdminDiscountStates.waiting_for_discount_percent)
+    await message.answer("🎯 حالا درصد تخفیف را ارسال کنید (عدد ۱ تا ۱۰۰):")
+
+
+@router.message(AdminDiscountStates.waiting_for_discount_percent)
+async def process_discount_percent(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    percent_str = message.text.strip()
+    if not percent_str.isdigit():
+        await message.answer("❌ لطفاً فقط عدد ارسال کنید.")
+        return
+    percent = int(percent_str)
+    if percent < 1 or percent > 100:
+        await message.answer("❌ درصد باید بین ۱ و ۱۰۰ باشد.")
+        return
+
+    data = await state.get_data()
+    code = data.get("discount_code")
+    vendor_id = data.get("discount_vendor_id")
+    if not code or not vendor_id:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        return
+
+    new_dc = DiscountCode(
+        vendor_id=int(vendor_id),
+        code=str(code),
+        discount_percent=percent,
+        is_active=True,
+    )
+    db_session.add(new_dc)
+    await db_session.commit()
+    await state.clear()
+    await message.answer(f"✅ کد تخفیف «{code}» با {percent}% تخفیف ایجاد شد.")
+
+    # بازگشت خودکار به پنل
+    text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
+    if text:
+        await message.answer(text, reply_markup=reply_markup)
+
+
+@router.callback_query(F.data.startswith("delete_dc_"))
+async def admin_discount_delete(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+    dc_id_str = callback.data.replace("delete_dc_", "")
+    if not dc_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    dc_id = int(dc_id_str)
+
+    # 🌟 گارد مالکیت: اطمینان از اینکه کد متعلق به این فروشنده است
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    dc = (
+        await db_session.execute(
+            select(DiscountCode).where(
+                DiscountCode.id == dc_id,
+                DiscountCode.vendor_id == vendor.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not dc:
+        await callback.answer("❌ کد یافت نشد یا متعلق به شما نیست.", show_alert=True)
+        return
+
+    await db_session.delete(dc)
+    await db_session.commit()
+    await callback.answer("✅ کد تخفیف حذف شد", show_alert=True)
+
+    # بازگشت به منوی کدهای تخفیف با model_copy
+    new_callback = callback.model_copy(update={"data": "admin_discounts"})
+    await admin_discounts_menu(new_callback, db_session)
+
+
+# ==========================================
+# 🌟 [جدید] تنظیمات ریدایرکت فروشنده
+# ==========================================
+@router.callback_query(F.data == "admin_redirect")
+async def admin_redirect_menu(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # نام فروشنده هدف فعلی
+    target_name = "ندارد"
+    if vendor.redirect_target_id:
+        target = (
+            await db_session.execute(select(Vendor).where(Vendor.id == vendor.redirect_target_id))
+        ).scalar_one_or_none()
+        if target:
+            target_name = f"{target.name} (ID: {target.id})"
+
+    text = (
+        "🔄 <b>تنظیمات ریدایرکت</b>\n\n"
+        "با فعالسازی ریدایرکت، تمام تراکنشها و تیکتهای کاربران شما به فروشنده هدف منتقل می‌شود.\n\n"
+        f"🎯 <b>فروشنده هدف فعلی:</b> {target_name}\n\n"
+        "برای تنظیم فروشنده هدف، شناسه عددی آن فروشنده را ارسال کنید.\n"
+        "برای حذف ریدایرکت، عدد 0 را ارسال کنید."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="back_to_admin_panel")]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await state.set_state(AdminRedirectStates.waiting_for_redirect_target_id)
+    await callback.answer()
+
+
+@router.message(AdminRedirectStates.waiting_for_redirect_target_id)
+async def process_redirect_target(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    target_str = message.text.strip()
+    if not target_str.isdigit():
+        await message.answer("❌ لطفاً فقط شناسه عددی ارسال کنید.")
+        return
+    target_id = int(target_str)
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
+
+    if target_id == 0:
+        vendor.redirect_target_id = None
+        await db_session.commit()
+        await state.clear()
+        await message.answer("✅ ریدایرکت با موفقیت حذف شد.")
+    else:
+        # بررسی وجود فروشنده هدف + جلوگیری از ریدایرکت به خودش
+        if target_id == vendor.id:
+            await message.answer("❌ نمی‌توانید ریدایرکت را به خودتان تنظیم کنید.")
+            return
+        target_vendor = (
+            await db_session.execute(select(Vendor).where(Vendor.id == target_id))
+        ).scalar_one_or_none()
+        if not target_vendor:
+            await message.answer("❌ فروشنده‌ای با این شناسه یافت نشد.")
+            return
+        vendor.redirect_target_id = target_id
+        await db_session.commit()
+        await state.clear()
+        await message.answer(f"✅ ریدایرکت به «{target_vendor.name}» تنظیم شد.")
+
+    # بازگشت خودکار به پنل
+    text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
+    if text:
+        await message.answer(text, reply_markup=reply_markup)
+
+
+# ==========================================
+# 🌟 [جدید] گزارش مالی پیشرفته
+# ==========================================
+@router.callback_query(F.data == "admin_reports")
+async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # ۱) مجموع فروش این فروشنده (تراکنشهای تاییدشده)
+    total_sales = await db_session.scalar(
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            Transaction.vendor_id == vendor.id,
+            Transaction.status == "approved",
+        )
+    )
+    total_sales = int(total_sales or 0)
+
+    # ۲) حسابداری ریدایرکت: پول شما در حساب فروشنده هدف
+    money_in_targets = await db_session.scalar(
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            Transaction.origin_vendor_id == vendor.id,
+            Transaction.vendor_id != vendor.id,
+            Transaction.status == "approved",
+        )
+    )
+    money_in_targets = int(money_in_targets or 0)
+
+    # ۳) حسابداری ریدایرکت: پول شرکای دیگر در حساب شما
+    money_from_redirectors = await db_session.scalar(
+        select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+            Transaction.vendor_id == vendor.id,
+            Transaction.origin_vendor_id.is_not(None),
+            Transaction.origin_vendor_id != vendor.id,
+            Transaction.status == "approved",
+        )
+    )
+    money_from_redirectors = int(money_from_redirectors or 0)
+
+    # ۴) آمار سرورها (Group by Server): مجموع حجم پلنها و تعداد فروش
+    server_stats = (
+        await db_session.execute(
+            select(
+                Server.name.label("server_name"),
+                func.coalesce(func.sum(Plan.volume_gb), 0).label("total_gb"),
+                func.count(Plan.id).label("plans_sold"),
+            )
+            .join(Plan, Plan.server_id == Server.id)
+            .join(Transaction, Transaction.plan_id == Plan.id)
+            .where(
+                Transaction.vendor_id == vendor.id,
+                Transaction.status == "approved",
+            )
+            .group_by(Server.id, Server.name)
+            .order_by(Server.name)
+        )
+    ).all()
+
+    report_lines: list[str] = [
+        "📊 <b>گزارش مالی</b>\n",
+        f"👤 <b>فروشگاه:</b> {vendor.name}\n",
+        "━━━━━━━━━━━━━\n",
+        "💼 <b>آمار فروش شما</b>",
+        f"💰 مجموع فروش: <code>{total_sales:,}</code> تومان",
+        f"📤 پول شما در حساب فروشنده هدف: <code>{money_in_targets:,}</code> تومان",
+        f"📥 پول شرکای دیگر در حساب شما: <code>{money_from_redirectors:,}</code> تومان\n",
+        "━━━━━━━━━━━━━\n",
+        "🖥 <b>آمار سرورها</b>",
+    ]
+
+    if server_stats:
+        for row in server_stats:
+            # row: server_name, total_gb, plans_sold
+            report_lines.append(f"• {row.server_name}: {int(row.total_gb)} GB / {int(row.plans_sold)} پلن فروختهشده")
+    else:
+        report_lines.append("هیچ فروشی ثبت نشده است.")
+
+    # ۵) آمار جهانی بات (فقط برای مالک)
+    owner_id_str = os.getenv("OWNER_ID")
+    is_owner = bool(owner_id_str and callback.from_user.id == int(owner_id_str))
+    if is_owner:
+        global_sales = await db_session.scalar(
+            select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+                Transaction.status == "approved",
+            )
+        )
+        global_sales = int(global_sales or 0)
+        global_volume = await db_session.scalar(
+            select(func.coalesce(func.sum(Plan.volume_gb), 0))
+            .join(Transaction, Transaction.plan_id == Plan.id)
+            .where(Transaction.status == "approved")
+        )
+        global_volume = int(global_volume or 0)
+
+        report_lines.extend([
+            "\n━━━━━━━━━━━━━\n",
+            "👑 <b>آمار جهانی بات (مالک)</b>",
+            f"💰 مجموع فروش کل بات: <code>{global_sales:,}</code> تومان",
+            f"💽 مجموع حجم فروختهشده: <code>{global_volume}</code> GB",
+        ])
+
+    text = "\n".join(report_lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+# ==========================================
+# 🌟 [جدید] مدیریت شرکا (Owner Only)
+# ==========================================
+@router.callback_query(F.data == "owner_manage_vendors")
+async def admin_manage_vendors_menu(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    # گارد مالک
+    owner_id_str = os.getenv("OWNER_ID")
+    if not (owner_id_str and callback.from_user.id == int(owner_id_str)):
+        await callback.answer("❌ این بخش فقط برای مالک بات قابل دسترسی است.", show_alert=True)
+        return
+
+    # فهرست تمام شرکا
+    vendors = (
+        await db_session.execute(select(Vendor).order_by(Vendor.id.asc()))
+    ).scalars().all()
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for v in vendors:
+        status = "🟢" if v.is_active else "🔴"
+        kb_rows.append([InlineKeyboardButton(text=f"{status} {v.name} (ID: {v.id})", callback_data=f"adm_ven_{v.id}")])
+    kb_rows.append([InlineKeyboardButton(text="➕ افزودن شریک جدید", callback_data="adm_ven_add")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    text = (
+        "👑 <b>مدیریت شرکا</b>\n\n"
+        f"تعداد کل شرکا: <code>{len(vendors)}</code>\n\n"
+        "برای افزودن شریک جدید، روی دکمه زیر کلیک کنید."
+    )
+
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_ven_add")
+async def admin_add_vendor_start(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    # گارد مالک
+    owner_id_str = os.getenv("OWNER_ID")
+    if not (owner_id_str and callback.from_user.id == int(owner_id_str)):
+        await callback.answer("❌ دسترسی غیرمجاز.", show_alert=True)
+        return
+
+    text = (
+        "➕ <b>افزودن شریک جدید</b>\n\n"
+        "لطفاً شناسه تلگرام (Telegram ID) عددی شریک جدید را ارسال کنید:\n"
+        "مثال: <code>123456789</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="owner_manage_vendors")]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await state.set_state(AdminPartnerStates.waiting_for_partner_telegram_id)
+    await callback.answer()
+
+
+@router.message(AdminPartnerStates.waiting_for_partner_telegram_id)
+async def process_partner_telegram_id(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    tg_id_str = message.text.strip()
+    if not tg_id_str.isdigit():
+        await message.answer("❌ لطفاً فقط شناسه عددی ارسال کنید.")
+        return
+    tg_id = int(tg_id_str)
+
+    # بررسی تکراری نبودن
+    existing = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == tg_id))
+    ).scalar_one_or_none()
+    if existing:
+        await message.answer(f"❌ این شناسه قبلاً به عنوان شریک ثبت شده است: {existing.name}")
+        return
+
+    await state.update_data(new_vendor_tg_id=tg_id)
+    await state.set_state(AdminPartnerStates.waiting_for_partner_name)
+    await message.answer("✅ شناسه ثبت شد.\n🏷 حالا نام فروشگاه این شریک را ارسال کنید:")
+
+
+@router.message(AdminPartnerStates.waiting_for_partner_name)
+async def process_partner_name(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    name = message.text.strip()
+    if not (2 <= len(name) <= 50):
+        await message.answer("❌ نام باید بین ۲ و ۵۰ کاراکتر باشد.")
+        return
+
+    data = await state.get_data()
+    tg_id = data.get("new_vendor_tg_id")
+    if not tg_id:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        return
+
+    new_vendor = Vendor(
+        telegram_id=int(tg_id),
+        name=name,
+        is_active=True,
+    )
+    db_session.add(new_vendor)
+    await db_session.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ شریک جدید با موفقیت ایجاد شد!\n\n"
+        f"🏷 نام: {name}\n"
+        f"🆔 تلگرام: <code>{tg_id}</code>\n\n"
+        "این کاربر با ارسال /admin می‌تواند وارد پنل مدیریت شود."
+    )
+
+    # بازگشت خودکار به پنل
+    text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
+    if text:
+        await message.answer(text, reply_markup=reply_markup)
