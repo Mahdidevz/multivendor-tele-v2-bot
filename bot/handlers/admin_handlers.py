@@ -1993,11 +1993,24 @@ async def admin_customer_detail(callback: types.CallbackQuery, db_session: Async
         return
     user_id = int(user_id_str)
 
+    # 🌟 [Bug 1 Fix] گارد مالکیت: اول فروشنده اجراکننده را واکشی کن
+    admin_vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
     user = (
         await db_session.execute(select(User).where(User.id == user_id))
     ).scalar_one_or_none()
     if not user:
         await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Bug 1 Fix] بررسی مالکیت: کاربر باید متعلق به این فروشنده باشد
+    if user.vendor_id != admin_vendor.id:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
 
     text = (
@@ -2020,7 +2033,7 @@ async def admin_customer_detail(callback: types.CallbackQuery, db_session: Async
 
 
 @router.callback_query(F.data.startswith("adm_cust_chg_"))
-async def admin_wallet_charge_start(callback: types.CallbackQuery, state: FSMContext):
+async def admin_wallet_charge_start(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
     if not callback.data or not callback.from_user:
         await callback.answer()
         return
@@ -2030,6 +2043,26 @@ async def admin_wallet_charge_start(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
         return
     user_id = int(user_id_str)
+
+    # 🌟 [Bug 1 Fix] گارد مالکیت
+    admin_vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    target_user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not target_user:
+        await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Bug 1 Fix] بررسی مالکیت
+    if target_user.vendor_id != admin_vendor.id:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
+        return
 
     await state.update_data(target_user_id=user_id)
     await state.set_state(AdminCustomerStates.waiting_for_wallet_charge_amount)
@@ -2067,12 +2100,27 @@ async def process_wallet_charge_amount(message: types.Message, state: FSMContext
         await state.clear()
         return
 
+    # 🌟 [Bug 1 Fix] گارد مالکیت مجدد (حتی داخل FSM برای جلوگیری از جعل state)
+    admin_vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await state.clear()
+        await message.answer("❌ فروشنده یافت نشد.")
+        return
+
     user = (
         await db_session.execute(select(User).where(User.id == int(target_user_id)))
     ).scalar_one_or_none()
     if not user:
         await state.clear()
         await message.answer("❌ کاربر یافت نشد.")
+        return
+
+    # 🌟 [Bug 1 Fix] بررسی مالکیت قبل از تغییر موجودی
+    if user.vendor_id != admin_vendor.id:
+        await state.clear()
+        await message.answer("❌ دسترسی غیرمجاز")
         return
 
     user.wallet_balance += amount
@@ -2110,11 +2158,24 @@ async def admin_customer_services(callback: types.CallbackQuery, db_session: Asy
         return
     user_id = int(user_id_str)
 
+    # 🌟 [Bug 1 Fix] گارد مالکیت
+    admin_vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
     user = (
         await db_session.execute(select(User).where(User.id == user_id))
     ).scalar_one_or_none()
     if not user:
         await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Bug 1 Fix] بررسی مالکیت
+    if user.vendor_id != admin_vendor.id:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
 
     transactions = (
@@ -2135,7 +2196,7 @@ async def admin_customer_services(callback: types.CallbackQuery, db_session: Asy
             kb_rows.append([
                 InlineKeyboardButton(
                     text=f"📦 {tx.plan.title if tx.plan else 'نامشخص'}",
-                    callback_data=f"usr_srv_{tx.id}",
+                    callback_data=f"adm_usr_srv_{tx.id}",
                 )
             ])
     kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"adm_cust_det_{user.id}")])
@@ -2152,16 +2213,24 @@ async def admin_customer_services(callback: types.CallbackQuery, db_session: Asy
 # ==========================================
 # 🌟 [جدید] مانیتورینگ زنده سرویس مشتری (Admin-side)
 # ==========================================
-@router.callback_query(F.data.startswith("usr_srv_"))
+@router.callback_query(F.data.startswith("adm_usr_srv_"))
 async def admin_customer_service_monitor(callback: types.CallbackQuery, db_session: AsyncSession):
     if not callback.data or not callback.from_user:
         await callback.answer()
         return
-    tx_id_str = callback.data.replace("usr_srv_", "")
+    tx_id_str = callback.data.replace("adm_usr_srv_", "")
     if not tx_id_str.isdigit():
         await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
         return
     tx_id = int(tx_id_str)
+
+    # 🌟 [Bug 1 Fix] گارد مالکیت فروشنده اجراکننده
+    admin_vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not admin_vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
 
     stmt = (
         select(Transaction)
@@ -2174,6 +2243,11 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
     tx = (await db_session.execute(stmt)).scalar_one_or_none()
     if not tx or not tx.user or not tx.plan or not tx.plan.server:
         await callback.answer("❌ سرویس یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Bug 1 Fix] بررسی مالکیت: کاربر مالک تراکنش باید متعلق به این فروشنده باشد
+    if tx.user.vendor_id != admin_vendor.id:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
 
     server: Server = tx.plan.server
@@ -2190,7 +2264,7 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
         await client.close()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"usr_srv_{tx.id}")],
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"adm_usr_srv_{tx.id}")],
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"adm_cust_srv_{tx.user.id}")],
     ])
 
@@ -2548,27 +2622,31 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # ۱) مجموع فروش این فروشنده (تراکنشهای تاییدشده)
-    total_sales = await db_session.scalar(
+    # ۱) فروش مستقیم خودتان: vendor_id == vendor.id AND (origin_vendor_id IS NULL OR origin_vendor_id == vendor.id)
+    direct_sales = await db_session.scalar(
         select(func.coalesce(func.sum(Transaction.amount), 0)).where(
             Transaction.vendor_id == vendor.id,
             Transaction.status == "approved",
+            or_(
+                Transaction.origin_vendor_id.is_(None),
+                Transaction.origin_vendor_id == vendor.id,
+            ),
         )
     )
-    total_sales = int(total_sales or 0)
+    direct_sales = int(direct_sales or 0)
 
-    # ۲) حسابداری ریدایرکت: پول شما در حساب فروشنده هدف
-    money_in_targets = await db_session.scalar(
+    # ۲) ارجاع داده شده به همکاران: origin_vendor_id == vendor.id AND vendor_id != vendor.id
+    routed_to_others = await db_session.scalar(
         select(func.coalesce(func.sum(Transaction.amount), 0)).where(
             Transaction.origin_vendor_id == vendor.id,
             Transaction.vendor_id != vendor.id,
             Transaction.status == "approved",
         )
     )
-    money_in_targets = int(money_in_targets or 0)
+    routed_to_others = int(routed_to_others or 0)
 
-    # ۳) حسابداری ریدایرکت: پول شرکای دیگر در حساب شما
-    money_from_redirectors = await db_session.scalar(
+    # ۳) دریافت شده از همکاران: vendor_id == vendor.id AND origin_vendor_id IS NOT NULL AND origin_vendor_id != vendor.id
+    received_from_others = await db_session.scalar(
         select(func.coalesce(func.sum(Transaction.amount), 0)).where(
             Transaction.vendor_id == vendor.id,
             Transaction.origin_vendor_id.is_not(None),
@@ -2576,9 +2654,12 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
             Transaction.status == "approved",
         )
     )
-    money_from_redirectors = int(money_from_redirectors or 0)
+    received_from_others = int(received_from_others or 0)
 
-    # ۴) آمار سرورها (Group by Server): مجموع حجم پلنها و تعداد فروش
+    # ۴) کل واریزی به حساب شما = فروش مستقیم + دریافتی از همکاران
+    total_deposits = direct_sales + received_from_others
+
+    # ۵) آمار سرورها (Group by Server): مجموع حجم پلنها و تعداد فروش
     server_stats = (
         await db_session.execute(
             select(
@@ -2601,18 +2682,24 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
         "📊 <b>گزارش مالی</b>\n",
         f"👤 <b>فروشگاه:</b> {vendor.name}\n",
         "━━━━━━━━━━━━━\n",
-        "💼 <b>آمار فروش شما</b>",
-        f"💰 مجموع فروش: <code>{total_sales:,}</code> تومان",
-        f"📤 پول شما در حساب فروشنده هدف: <code>{money_in_targets:,}</code> تومان",
-        f"📥 پول شرکای دیگر در حساب شما: <code>{money_from_redirectors:,}</code> تومان\n",
+        "💼 <b>گزارش فروش تفکیکیشده</b>",
+        f"🟢 فروش مستقیم خودتان: <code>{direct_sales:,}</code> تومان",
+        f"📤 ارجاع داده شده به همکاران: <code>{routed_to_others:,}</code> تومان",
+        f"📥 دریافت شده از همکاران: <code>{received_from_others:,}</code> تومان",
+        "",
+        f"💰 <b>کل واریزی به حساب شما:</b> <code>{total_deposits:,}</code> تومان\n",
         "━━━━━━━━━━━━━\n",
-        "🖥 <b>آمار سرورها</b>",
+        "🖥 <b>آمار سرورها</b>\n",
     ]
 
     if server_stats:
         for row in server_stats:
             # row: server_name, total_gb, plans_sold
-            report_lines.append(f"• {row.server_name}: {int(row.total_gb)} GB / {int(row.plans_sold)} پلن فروختهشده")
+            report_lines.extend([
+                f"🖥 سرور: {row.server_name}",
+                f" ├ 📦 تعداد پلن فروخته شده: {int(row.plans_sold)}",
+                f" └ 💽 مجموع حجم فروش: {int(row.total_gb)} گیگابایت\n",
+            ])
     else:
         report_lines.append("هیچ فروشی ثبت نشده است.")
 
