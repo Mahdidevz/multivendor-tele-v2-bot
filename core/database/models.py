@@ -70,6 +70,8 @@ class Server(Base):
     password: Mapped[str] = mapped_column(String(255))
     total_capacity: Mapped[float] = mapped_column(Float, default=0.0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 🌟 [Soft Delete] حذف نرم برای حفظ یکپارچگی دادهها و گزارشهای مالی
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False , server_default="false")
 
     vendor_servers = relationship("VendorServer", back_populates="server")
     transactions = relationship("Transaction", back_populates="server")
@@ -95,6 +97,8 @@ class Plan(Base):
     price: Mapped[float] = mapped_column(Float)
     description: Mapped[str] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 🌟 [Soft Delete] حذف نرم برای حفظ یکپارچگی دادهها و گزارشهای مالی
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False , server_default="false")
 
     vendor = relationship("Vendor", back_populates="plans")
     server = relationship("Server", back_populates="plans") # 🌟 اتصال به آبجکت سرور

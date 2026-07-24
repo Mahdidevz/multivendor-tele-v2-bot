@@ -362,7 +362,8 @@ async def admin_view_servers(callback: types.CallbackQuery, db_session: AsyncSes
         or_(
             Server.vendor_id == vendor.id,
             Server.id.in_(shared_subq)
-        )
+        ),
+        Server.is_deleted == False,
     )
     servers = (await db_session.execute(stmt)).scalars().all()
 
@@ -773,13 +774,12 @@ async def delete_server(callback: types.CallbackQuery, db_session: AsyncSession)
         await callback.answer("❌ سرور یافت نشد.", show_alert=True)
         return
 
-    # 🌟 روابط VendorServer بهصورت Cascade روی DB حذف میشوند؛ nonetheless صریحًا پاک میکنیم تا سشن sync بماند
-    vs_stmt = select(VendorServer).where(VendorServer.server_id == srv_id)
-    vs_rows = (await db_session.execute(vs_stmt)).scalars().all()
-    for vs in vs_rows:
-        await db_session.delete(vs)
-
-    await db_session.delete(server)
+    # 🌟 [Soft Delete] حذف نرم سرور + آبشاری کردن روی پلنها
+    server.is_deleted = True
+    server.is_active = False
+    await db_session.execute(
+        update(Plan).where(Plan.server_id == server.id).values(is_deleted=True, is_active=False)
+    )
     await db_session.commit()
 
     await callback.answer("✅ سرور حذف شد.", show_alert=True)
@@ -819,6 +819,7 @@ async def add_plan_select_server(callback: types.CallbackQuery, db_session: Asyn
     shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
     stmt = select(Server).where(
         Server.is_active == True,
+        Server.is_deleted == False,
         or_(
             Server.vendor_id == vendor.id,
             Server.id.in_(shared_subq),
@@ -938,13 +939,69 @@ async def plan_description(message: types.Message, state: FSMContext, db_session
     if text: await message.answer(text, reply_markup=reply_markup)
 
 
+# ==========================================
+# 🌟 [Co-Ownership Model] Helper: اعتبارسنجی دسترسی اشتراکی به پلن
+# ==========================================
+async def _check_plan_access(
+    db_session: AsyncSession,
+    plan_id: int,
+    admin_vendor_id: int,
+) -> tuple[Plan | None, bool]:
+    """بررسی دسترسی فروشنده به پلن بر اساس مالکیت/اشتراک سرور.
+
+    بازگشت: (plan, has_access)
+    - اگر پلن وجود نداشته باشد → (None, False)
+    - اگر پلن وجود داشته اما سرور آن در دسترس فروشنده نباشد → (plan, False)
+    - اگر دسترسی باشد → (plan, True)
+    """
+    plan = (
+        await db_session.execute(
+            select(Plan)
+            .options(selectinload(Plan.server))
+            .where(Plan.id == plan_id)
+        )
+    ).scalar_one_or_none()
+    if not plan:
+        return None, False
+
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == admin_vendor_id)
+    accessible_server = (
+        await db_session.execute(
+            select(Server.id).where(
+                Server.id == plan.server_id,
+                or_(
+                    Server.vendor_id == admin_vendor_id,
+                    Server.id.in_(shared_subq),
+                ),
+            )
+        )
+    ).scalar_one_or_none()
+
+    return plan, accessible_server is not None
+
+
 @router.callback_query(F.data == "adm_view_srv_plans")
 async def admin_view_categories_by_server(callback: types.CallbackQuery, db_session: AsyncSession):
     if not callback.from_user: return
     vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if not vendor: return
 
-    stmt = select(Server).join(Plan).where(Plan.vendor_id == vendor.id).distinct()
+    # 🌟 [Co-Ownership Model] سرورهایی که پلن فعال دارند و برای این فروشنده قابلدسترس هستند
+    # دسترسی بر اساس مالکیت سرور یا اشتراک از طریق VendorServer بررسی میشود، نه سازنده پلن.
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
+    stmt = (
+        select(Server)
+        .join(Plan, Plan.server_id == Server.id)
+        .where(
+            Plan.is_deleted == False,
+            Server.is_deleted == False,
+            or_(
+                Server.vendor_id == vendor.id,
+                Server.id.in_(shared_subq),
+            ),
+        )
+        .distinct()
+    )
     servers_with_plans = (await db_session.execute(stmt)).scalars().all()
 
     if not servers_with_plans:
@@ -970,7 +1027,21 @@ async def admin_view_plans_in_server(callback: types.CallbackQuery, db_session: 
     vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if not vendor: return
 
-    stmt = select(Plan).where(Plan.vendor_id == vendor.id, Plan.server_id == srv_id)
+    # 🌟 [Co-Ownership Model] پلنهای سرور انتخابشده — بدون فیلتر سازنده پلن
+    # فقط دسترسی فروشنده به سرور بررسی میشود.
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
+    stmt = (
+        select(Plan)
+        .join(Server, Server.id == Plan.server_id)
+        .where(
+            Plan.server_id == srv_id,
+            Plan.is_deleted == False,
+            or_(
+                Server.vendor_id == vendor.id,
+                Server.id.in_(shared_subq),
+            ),
+        )
+    )
     plans = (await db_session.execute(stmt)).scalars().all()
     server = (await db_session.execute(select(Server).where(Server.id == srv_id))).scalar_one_or_none()
 
@@ -986,13 +1057,26 @@ async def admin_view_plans_in_server(callback: types.CallbackQuery, db_session: 
 
 @router.callback_query(F.data.startswith("adm_p_"))
 async def admin_show_plan_details(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
+    if not callback.data or not callback.from_user: return
     plan_id_str = callback.data.replace("adm_p_", "")
     if not plan_id_str.isdigit(): return
     plan_id = int(plan_id_str)
 
-    plan = (await db_session.execute(select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id))).scalar_one_or_none()
-    if not plan: return
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی بر اساس سرور، نه سازنده پلن
+    plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
+    if not plan:
+        await callback.answer("❌ پلن یافت نشد.", show_alert=True)
+        return
+    if not has_access:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
+        return
 
     status = "🟢 فعال" if plan.is_active else "🔴 غیرفعال"
     vol = "نامحدود" if plan.volume_gb == 0 else f"{plan.volume_gb}GB"
@@ -1024,7 +1108,7 @@ async def admin_show_plan_details(callback: types.CallbackQuery, db_session: Asy
 
 @router.callback_query(F.data.startswith("adm_tog_"))
 async def admin_toggle_plan(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data:
+    if not callback.data or not callback.from_user:
         await callback.answer()
         return
 
@@ -1034,9 +1118,21 @@ async def admin_toggle_plan(callback: types.CallbackQuery, db_session: AsyncSess
         return
 
     plan_id = int(plan_id_str)
-    plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی بر اساس سرور
+    plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
     if not plan:
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
+        return
+    if not has_access:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
 
     plan.is_active = not plan.is_active
@@ -1049,7 +1145,7 @@ async def admin_toggle_plan(callback: types.CallbackQuery, db_session: AsyncSess
 
 @router.callback_query(F.data.startswith("adm_del_"))
 async def admin_delete_plan(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data:
+    if not callback.data or not callback.from_user:
         await callback.answer()
         return
 
@@ -1059,13 +1155,27 @@ async def admin_delete_plan(callback: types.CallbackQuery, db_session: AsyncSess
         return
 
     plan_id = int(plan_id_str)
-    plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی بر اساس سرور
+    plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
     if not plan:
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
         return
+    if not has_access:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
+        return
 
     srv_id = plan.server_id
-    await db_session.delete(plan)
+    # 🌟 [Soft Delete] حذف نرم پلن
+    plan.is_deleted = True
+    plan.is_active = False
     await db_session.commit()
 
     await callback.answer("✅ حذف شد.", show_alert=True)
@@ -1075,9 +1185,26 @@ async def admin_delete_plan(callback: types.CallbackQuery, db_session: AsyncSess
     await admin_view_plans_in_server(new_callback, db_session)
 
 @router.callback_query(F.data.startswith("adm_edp_"))
-async def admin_edit_price(callback: types.CallbackQuery, state: FSMContext):
-    if not callback.data: return
+async def admin_edit_price(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.data or not callback.from_user: return
     plan_id = int(callback.data.replace("adm_edp_", ""))
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی قبل از ورود به FSM
+    plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
+    if not plan:
+        await callback.answer("❌ پلن یافت نشد.", show_alert=True)
+        return
+    if not has_access:
+        await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
+        return
+
     await state.update_data(edit_plan_id=plan_id)
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_p_{plan_id}")]])
     if isinstance(callback.message, types.Message):
@@ -1093,11 +1220,18 @@ async def admin_process_new_price(message: types.Message, state: FSMContext, db_
     data = await state.get_data()
     plan_id = data.get("edit_plan_id")
     if plan_id:
-        plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
-        if plan:
-            plan.price = float(message.text)
-            await db_session.commit()
-            await message.answer("✅ قیمت بروزرسانی شد.")
+        # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی مجدد داخل FSM (جلوگیری از جعل state)
+        vendor = (
+            await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))
+        ).scalar_one_or_none()
+        if vendor:
+            plan, has_access = await _check_plan_access(db_session, int(plan_id), vendor.id)
+            if plan and has_access:
+                plan.price = float(message.text)
+                await db_session.commit()
+                await message.answer("✅ قیمت بروزرسانی شد.")
+            else:
+                await message.answer("❌ دسترسی غیرمجاز")
     await state.clear()
 
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
@@ -1177,8 +1311,11 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
 
         server = plan.server
 
+        # 🌟 [Bug Fix Phase 4] کسر هزینه واقعی با درنظرگرفتن تخفیف (نه قیمت کامل پلن)
+        # منطق: original_amount - (original_amount * discount_percent // 100) == مبلغ نهایی پرداختی
+        actual_cost = tx.original_amount - (tx.original_amount * tx.discount_percent // 100)
         user.wallet_balance += tx.amount
-        user.wallet_balance -= plan.price
+        user.wallet_balance -= actual_cost
         await db_session.commit()
 
         # ---------------------------------------------------------

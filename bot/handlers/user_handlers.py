@@ -126,8 +126,27 @@ async def process_buy_new_service(callback: types.CallbackQuery, db_session: Asy
         await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
         return
 
-    # 🌟 واکشی سرورهایی که برای این فروشنده پلن فعال دارند
-    stmt_servers = select(Server).join(Plan).where(Plan.vendor_id == user.vendor_id, Plan.is_active == True).distinct()
+    # 🌟 [Reseller Model] واکشی سرورهای فعال و قابلدسترس برای فروشنده کاربر
+    # یک سرور قابلدسترس است اگر:
+    #   a) مستقیماً متعلق به فروشنده کاربر باشد (Server.vendor_id == user.vendor_id)
+    #   b) از طریق جدول VendorServer با او اشتراک داده شده باشد
+    # پلنها دیگر بر اساس سازنده فیلتر نمیشوند؛ هر پلن روی سرور اشتراکی برای همه可见 است.
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == user.vendor_id)
+    stmt_servers = (
+        select(Server)
+        .join(Plan, Plan.server_id == Server.id)
+        .where(
+            Plan.is_active == True,
+            Plan.is_deleted == False,
+            Server.is_active == True,
+            Server.is_deleted == False,
+            or_(
+                Server.vendor_id == user.vendor_id,
+                Server.id.in_(shared_subq),
+            ),
+        )
+        .distinct()
+    )
     servers = (await db_session.execute(stmt_servers)).scalars().all()
 
     if not servers:
@@ -165,10 +184,24 @@ async def process_server_selection(callback: types.CallbackQuery, db_session: As
     user = (await db_session.execute(stmt_user)).scalar_one_or_none()
     if not user: return
 
-    stmt_plans = select(Plan).options(selectinload(Plan.server)).where(
-        Plan.vendor_id == user.vendor_id,
-        Plan.server_id == srv_id,
-        Plan.is_active == True
+    # 🌟 [Reseller Model] واکشی پلنهای فعال روی سرور انتخابشده
+    # فقط بر اساس دسترسی فروشنده کاربر به سرور فیلتر میشود، نه سازنده پلن.
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == user.vendor_id)
+    stmt_plans = (
+        select(Plan)
+        .options(selectinload(Plan.server))
+        .join(Server, Server.id == Plan.server_id)
+        .where(
+            Plan.server_id == srv_id,
+            Plan.is_active == True,
+            Plan.is_deleted == False,
+            Server.is_active == True,
+            Server.is_deleted == False,
+            or_(
+                Server.vendor_id == user.vendor_id,
+                Server.id.in_(shared_subq),
+            ),
+        )
     )
     plans = (await db_session.execute(stmt_plans)).scalars().all()
 
@@ -335,9 +368,25 @@ async def process_discount_code(message: types.Message, state: FSMContext, db_se
         return
 
     code = message.text.strip()
+
+    # 🌟 [Co-Ownership Model] تعیین فروشندههای مجاز برای کد تخفیف:
+    # 1) فروشنده متصل به کاربر (user.vendor_id)
+    # 2) مالک اصلی سروری که پلن روی آن قرار دارد (Server.vendor_id)
+    # این امکان را میدهد که کدهای تخفیف مالک روی سرور اشتراکی برای کاربران شرکا هم قابل استفاده باشند.
+    allowed_vendor_ids: list[int] = [int(vendor_id)]
+
+    stmt_plan_srv = (
+        select(Server.vendor_id)
+        .join(Plan, Plan.server_id == Server.id)
+        .where(Plan.id == int(plan_id))
+    )
+    server_owner_id = (await db_session.execute(stmt_plan_srv)).scalar_one_or_none()
+    if server_owner_id is not None and server_owner_id not in allowed_vendor_ids:
+        allowed_vendor_ids.append(int(server_owner_id))
+
     dc = (await db_session.execute(
         select(DiscountCode).where(
-            DiscountCode.vendor_id == int(vendor_id),
+            DiscountCode.vendor_id.in_(allowed_vendor_ids),
             DiscountCode.code == code,
             DiscountCode.is_active == True,
         )
@@ -1120,6 +1169,7 @@ async def free_test_show_servers(callback: types.CallbackQuery, db_session: Asyn
     stmt_servers = select(Server).where(
         or_(Server.vendor_id == user.vendor_id, Server.id.in_(shared_subq)),
         Server.is_active == True,
+        Server.is_deleted == False,
     )
     servers = (await db_session.execute(stmt_servers)).scalars().all()
 
