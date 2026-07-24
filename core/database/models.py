@@ -25,8 +25,11 @@ class Vendor(Base):
     redirect_to = relationship("Vendor", remote_side=[id], backref="redirects_received")
     plans = relationship("Plan", back_populates="vendor", cascade="all, delete-orphan")
 
-    # 🌟 [جدید] رابطه: هر فروشنده می‌تواند سرورهای اختصاصی خودش را داشته باشد
+    # 🌟 [جدید] رابطه: هر فروشنده میتواند سرورهای اختصاصی خودش را داشته باشد
     servers = relationship("Server", back_populates="vendor")
+
+    # 🌟 [جدید] رابطه: تیکت‌های پشتیبانی دریافتشده توسط این فروشنده
+    tickets = relationship("Ticket", back_populates="vendor", foreign_keys="Ticket.vendor_id")
 
 
 class Server(Base):
@@ -94,6 +97,9 @@ class User(Base):
     vendor = relationship("Vendor", back_populates="users")
     transactions = relationship("Transaction", back_populates="user")
 
+    # 🌟 [جدید] رابطه: تیکت‌های پشتیبانی ارسالشده توسط این کاربر
+    tickets = relationship("Ticket", back_populates="user")
+
 
 class Transaction(Base):
     __tablename__ = 'transactions'
@@ -112,3 +118,18 @@ class Transaction(Base):
     vendor = relationship("Vendor", back_populates="transactions")
     server = relationship("Server", back_populates="transactions")
     plan = relationship("Plan", back_populates="transactions")
+
+
+class Ticket(Base):
+    """🌟 [جدید] مدل تیکت‌های پشتیبانی کاربران."""
+    __tablename__ = 'tickets'
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'))
+    vendor_id: Mapped[int] = mapped_column(ForeignKey('vendors.id', ondelete='CASCADE'))
+    message_text: Mapped[str] = mapped_column(String(1000))
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending | answered | closed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="tickets")
+    vendor = relationship("Vendor", back_populates="tickets", foreign_keys=[vendor_id])

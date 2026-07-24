@@ -7,12 +7,22 @@ class WalletChargeStates(StatesGroup):
 class AdminStates(StatesGroup):
     waiting_for_card_number = State()
 
+
+class UserStates(StatesGroup):
+    """🌟 [جدید] وضعیت‌های مربوط به کاربر."""
+    waiting_for_support_message = State()
+
+
+class AdminTicketStates(StatesGroup):
+    """🌟 [جدید] وضعیت‌های مربوط به پاسخ به تیکت توسط ادمین."""
+    waiting_for_ticket_reply = State()
+
 class AddServerStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_url = State()
     waiting_for_username = State()
     waiting_for_password = State()
-    # 🌟 [جدید] مرحله اشتراک‌گذاری انتخابی سرور (Owner Only)
+    # 🌟 [جدید] مرحله اشتراکگذاری انتخابی سرور (Owner Only)
     waiting_for_vendor_selection = State()
 
 class AddPlanStates(StatesGroup):

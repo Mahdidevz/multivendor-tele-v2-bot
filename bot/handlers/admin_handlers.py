@@ -1,17 +1,17 @@
 import os
-import random
+import time
 import logging
 from typing import Sequence
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, update
 from sqlalchemy.orm import selectinload
 from aiogram.fsm.context import FSMContext
 
-from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates
-from core.database.models import Plan, Vendor, Transaction, Server, VendorServer
+from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates, AdminTicketStates
+from core.database.models import Plan, Vendor, Transaction, Server, VendorServer, Ticket
 from core.services.panel_client import MarzbanClient
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
     kb = [
         [
             InlineKeyboardButton(text="👥 مشتریان من", callback_data="admin_my_users"),
-            InlineKeyboardButton(text="💳 بررسی فیش‌ها", callback_data="admin_receipts")
+            InlineKeyboardButton(text="💳 بررسی فیشها", callback_data="admin_receipts")
         ],
         [
             InlineKeyboardButton(text="🔄 تنظیمات ریدایرکت", callback_data="admin_redirect"),
@@ -43,7 +43,8 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
             InlineKeyboardButton(text="🖥 مدیریت سرورها", callback_data="admin_view_servers")
         ],
         [
-            InlineKeyboardButton(text="🛍 مدیریت پلن‌ها", callback_data="admin_manage_plans")
+            InlineKeyboardButton(text="🛍 مدیریت پلنها", callback_data="admin_manage_plans"),
+            InlineKeyboardButton(text="📨 پیامهای پشتیبانی", callback_data="admin_support_tickets")
         ],
     ]
 
@@ -526,6 +527,15 @@ async def toggle_server_status(callback: types.CallbackQuery, db_session: AsyncS
         return
 
     server.is_active = not server.is_active
+
+    # 🌟 [جدید] Cascading Plan Deactivation:
+    # اگر سرور غیرفعال شد، تمام پلنهای متصل به آن نیز غیرفعال شوند.
+    # ولی اگر سرور مجدداً فعال شد، پلنها بهصورت خودکار فعال نمیشوند.
+    if not server.is_active:
+        await db_session.execute(
+            update(Plan).where(Plan.server_id == server.id).values(is_active=False)
+        )
+
     await db_session.commit()
 
     # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
@@ -864,7 +874,7 @@ async def admin_edit_price(callback: types.CallbackQuery, state: FSMContext):
 
 @router.message(EditPlanStates.waiting_for_new_price)
 async def admin_process_new_price(message: types.Message, state: FSMContext, db_session: AsyncSession):
-    if not message.text or not message.text.isdigit():
+    if not message.text or not message.from_user or not message.text.isdigit():
         await message.answer("❌ فقط عدد وارد کنید.")
         return
     data = await state.get_data()
@@ -878,17 +888,23 @@ async def admin_process_new_price(message: types.Message, state: FSMContext, db_
     await state.clear()
 
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
-    if text: await message.answer(text, reply_markup=reply_markup)
+    if text:
+        await message.answer(text, reply_markup=reply_markup)
 
 
 # ==========================================
-# 🌟 تایید و رد فیش (با API کامنت شده)
+# 🌟 تایید و رد فیش (با API واقعی)
 # ==========================================
 @router.callback_query(F.data.startswith("admin_approve_tx_"))
 async def admin_approve_transaction(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
     tx_id_str = callback.data.replace("admin_approve_tx_", "")
-    if not tx_id_str.isdigit(): return
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
     tx_id = int(tx_id_str)
 
     stmt = select(Transaction).options(
@@ -902,81 +918,130 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
         await callback.answer("❌ این فیش قبلاً بررسی شده یا وجود ندارد.", show_alert=True)
         return
 
+    # 🌟 گارد امنیتی: کاربر حتماً باید بارگذاری شده باشد
     user = tx.user
+    if not user:
+        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
+        return
+
+    bot = callback.bot
+    if not bot:
+        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
+        return
+
     tx.status = "approved"
 
     if not tx.plan_id:
+        # 🌟 شارژ عادی کیف پول (بدون پلن)
         user.wallet_balance += tx.amount
         await db_session.commit()
 
-        # 🌟 استفاده از bot.send_message برای رفع ارور InaccessibleMessage
         if isinstance(callback.message, types.Message):
             await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.reply(f"✅ فیش تایید شد.")
+            await callback.message.reply("✅ فیش تایید شد.")
 
-        await callback.bot.send_message(
-            user.telegram_id,
-            f"✅ <b>واریزی شما تایید شد!</b>\n\nمبلغ <code>{tx.amount:,}</code> تومان به کیف پول شما اضافه گردید.\nموجودی فعلی: {int(user.wallet_balance):,} تومان"
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                f"✅ <b>واریزی شما تایید شد!</b>\n\n"
+                f"مبلغ <code>{tx.amount:,}</code> تومان به کیف پول شما اضافه گردید.\n"
+                f"موجودی فعلی: <code>{int(user.wallet_balance):,}</code> تومان"
+            ),
         )
     else:
+        # 🌟 خرید پلن: کسر مبلغ از کیف پول + ساخت کاربر واقعی در پنل
         plan = tx.plan
-        if not plan: return
+        if not plan or not plan.server:
+            await callback.answer("❌ پلن یا سرور مرتبط یافت نشد.", show_alert=True)
+            return
+
+        server = plan.server
 
         user.wallet_balance += tx.amount
         user.wallet_balance -= plan.price
         await db_session.commit()
 
         # ---------------------------------------------------------
-        # 🌐 درخواست به API
+        # 🌐 ساخت کاربر واقعی در پنل Marzban
         # ---------------------------------------------------------
-        """
-        # client = MarzbanClient(plan.server.panel_url, plan.server.username, plan.server.password)
-        # try:
-        #     await client.login()
-        #     expire_timestamp = str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
-        #     data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
-        #
-        #     api_result = await client.create_user(
-        #         username=f"U_{user.telegram_id}_{tx.id}",
-        #         data_limit_bytes=data_limit_bytes,
-        #         expire_iso=expire_timestamp,
-        #         hwid_limit=plan.user_limit
-        #     )
-        #     sub_url = api_result.get("subscription_url", "خطا در لینک")
-        # except Exception as e:
-        #     sub_url = f"Error: {e}"
-        # finally:
-        #     await client.close()
-        """
+        username = f"U_{user.telegram_id}_{tx.id}"
+        expire_timestamp = str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
+        data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
 
-        mock_sub_link = f"https://vpn-sub.com/sub/{user.telegram_id}/{random.randint(1000, 9999)}"
+        sub_url = ""
+        client = MarzbanClient(
+            base_url=server.panel_url,
+            username=server.username,
+            password=server.password,
+        )
+        try:
+            await client.login()
+            api_result = await client.create_user(
+                username=username,
+                data_limit_bytes=data_limit_bytes,
+                expire_iso=expire_timestamp,
+                hwid_limit=plan.user_limit,
+            )
+            sub_url = str(api_result.get("subscription_url", ""))
+            if not sub_url:
+                sub_url = "خطا در دریافت لینک اشتراک از پنل."
+        except Exception as e:
+            logger.error(f"Failed to create Marzban user {username}: {e}")
+            sub_url = f"خطا در ارتباط با پنل: {e}"
+        finally:
+            await client.close()
 
         if isinstance(callback.message, types.Message):
             await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.reply(f"✅ فیش تایید شد و سرویس کاربر صادر گردید.")
+            await callback.message.reply("✅ فیش تایید شد و سرویس کاربر صادر گردید.")
 
         msg_to_user = (
             f"✅ <b>پرداخت شما تایید شد!</b>\n\n"
             f"🛍 <b>سرویس:</b> {plan.title}\n"
-            f"🔗 <b>لینک اشتراک شما:</b>\n<code>{mock_sub_link}</code>\n\n"
-            f"💡 آموزش اتصال: ابتدا لینک بالا را کپی کرده و در نرم‌افزار خود وارد کنید."
+            f"🔗 <b>لینک اشتراک شما:</b>\n<code>{sub_url}</code>\n\n"
+            f"💡 آموزش اتصال: ابتدا لینک بالا را کپی کرده و در نرمافزار خود وارد کنید."
         )
 
         # 🌟 استفاده امن از bot
-        await callback.bot.send_message(user.telegram_id, msg_to_user)
+        if isinstance(callback.message, types.Message):
+            await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
 
     await callback.answer()
 
+
 @router.callback_query(F.data.startswith("admin_reject_tx_"))
 async def admin_reject_transaction(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data: return
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
     tx_id_str = callback.data.replace("admin_reject_tx_", "")
-    if not tx_id_str.isdigit(): return
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
     tx_id = int(tx_id_str)
 
-    tx = (await db_session.execute(select(Transaction).options(selectinload(Transaction.user)).where(Transaction.id == tx_id))).scalar_one_or_none()
+    tx = (
+        await db_session.execute(
+            select(Transaction)
+            .options(selectinload(Transaction.user))
+            .where(Transaction.id == tx_id)
+        )
+    ).scalar_one_or_none()
+
     if not tx or tx.status != "pending":
         await callback.answer("❌ فیش قبلاً بررسی شده.", show_alert=True)
+        return
+
+    # 🌟 گارد امنیتی: کاربر حتماً باید بارگذاری شده باشد
+    user = tx.user
+    if not user:
+        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
+        return
+
+    bot = callback.bot
+    if not bot:
+        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
         return
 
     tx.status = "rejected"
@@ -986,8 +1051,239 @@ async def admin_reject_transaction(callback: types.CallbackQuery, db_session: As
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.reply("❌ فیش رد شد و به کاربر اطلاع داده شد.")
 
-    await callback.bot.send_message(
-        tx.user.telegram_id,
-        f"❌ <b>پرداخت شما تایید نشد.</b>\n\nفیش ارسالی برای مبلغ <code>{tx.amount:,}</code> تومان توسط پشتیبانی رد شد."
-    )
+    # 🌟 استفاده امن از bot
+    if isinstance(callback.message, types.Message):
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                f"❌ <b>پرداخت شما تایید نشد.</b>\n\n"
+                f"فیش ارسالی برای مبلغ <code>{tx.amount:,}</code> تومان توسط پشتیبانی رد شد."
+            ),
+        )
     await callback.answer()
+
+
+# ==========================================
+# 🌟 [جدید] داشبورد تیکت‌های پشتیبانی
+# ==========================================
+@router.callback_query(F.data == "admin_support_tickets")
+async def admin_support_tickets_list(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # واکشی تیکت‌های pending این فروشنده بههمراه کاربر
+    stmt = (
+        select(Ticket)
+        .options(selectinload(Ticket.user))
+        .where(Ticket.vendor_id == vendor.id, Ticket.status == "pending")
+        .order_by(Ticket.created_at.desc())
+    )
+    tickets = (await db_session.execute(stmt)).scalars().all()
+
+    if not tickets:
+        empty_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")]
+        ])
+        if isinstance(callback.message, types.Message):
+            await callback.message.edit_text(
+                "📨 <b>پیامهای پشتیبانی</b>\n\nهیچ پیام جدیدی وجود ندارد.",
+                reply_markup=empty_kb
+            )
+        await callback.answer()
+        return
+
+    kb: list[list[InlineKeyboardButton]] = []
+    for t in tickets:
+        user_display = t.user.telegram_id if t.user else "نامشخص"
+        kb.append([
+            InlineKeyboardButton(
+                text=f"📨 تیکت از کاربر {user_display}",
+                callback_data=f"adm_tk_{t.id}",
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            "📨 <b>پیامهای پشتیبانی</b>\n\nلیست پیامهای در انتظار پاسخ:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_tk_"))
+async def admin_show_ticket(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    ticket_id_str = callback.data.replace("adm_tk_", "")
+    if not ticket_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    ticket_id = int(ticket_id_str)
+
+    stmt = (
+        select(Ticket)
+        .options(selectinload(Ticket.user))
+        .where(Ticket.id == ticket_id)
+    )
+    ticket = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not ticket:
+        await callback.answer("❌ تیکت یافت نشد.", show_alert=True)
+        return
+
+    user_display = ticket.user.telegram_id if ticket.user else "نامشخص"
+    status_emoji = "🟡" if ticket.status == "pending" else ("🟢" if ticket.status == "answered" else "🔴")
+
+    text = (
+        f"📨 <b>تیکت پشتیبانی #{ticket.id}</b>\n\n"
+        f"👤 <b>کاربر:</b> <code>{user_display}</code>\n"
+        f"{status_emoji} <b>وضعیت:</b> {ticket.status}\n"
+        f"🕒 <b>زمان:</b> {ticket.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+        f"📝 <b>متن پیام:</b>\n{ticket.message_text}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ پاسخ (Reply)", callback_data=f"adm_tkr_{ticket.id}")],
+        [InlineKeyboardButton(text="❌ رد/بستن (Close)", callback_data=f"adm_tkc_{ticket.id}")],
+        [InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="admin_support_tickets")],
+    ])
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_tkr_"))
+async def admin_reply_ticket_start(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    ticket_id_str = callback.data.replace("adm_tkr_", "")
+    if not ticket_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    ticket_id = int(ticket_id_str)
+
+    # بررسی وجود تیکت
+    ticket = (
+        await db_session.execute(select(Ticket).where(Ticket.id == ticket_id))
+    ).scalar_one_or_none()
+    if not ticket:
+        await callback.answer("❌ تیکت یافت نشد.", show_alert=True)
+        return
+
+    await state.update_data(reply_ticket_id=ticket_id)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ لغو", callback_data=f"adm_tk_{ticket_id}")]
+    ])
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            "✍️ <b>پاسخ به تیکت</b>\n\nلطفاً متن پاسخ خود را ارسال کنید:",
+            reply_markup=cancel_kb
+        )
+    await state.set_state(AdminTicketStates.waiting_for_ticket_reply)
+    await callback.answer()
+
+
+@router.message(AdminTicketStates.waiting_for_ticket_reply)
+async def admin_reply_ticket_send(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    data = await state.get_data()
+    ticket_id = data.get("reply_ticket_id")
+    if not ticket_id:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        return
+
+    # واکشی تیکت بههمراه کاربر
+    stmt = (
+        select(Ticket)
+        .options(selectinload(Ticket.user))
+        .where(Ticket.id == int(ticket_id))
+    )
+    ticket = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not ticket or not ticket.user:
+        await message.answer("❌ تیکت یا کاربر یافت نشد.")
+        await state.clear()
+        return
+
+    reply_text = message.text.strip()
+    if not reply_text:
+        await message.answer("❌ متن پاسخ نمیتواند خالی باشد.")
+        return
+
+    # بروزرسانی وضعیت تیکت
+    ticket.status = "answered"
+    await db_session.commit()
+
+    # ارسال پاسخ به کاربر از طریق بات
+    msg_to_user = (
+        f"💬 <b>پاسخ پشتیبانی به تیکت #{ticket.id}</b>\n\n"
+        f"📝 <b>پیام اصلی شما:</b>\n{ticket.message_text}\n\n"
+        f"✍️ <b>پاسخ پشتیبانی:</b>\n{reply_text}"
+    )
+    try:
+        if message.bot:
+            await message.bot.send_message(chat_id=ticket.user.telegram_id, text=msg_to_user)
+        else:
+            logger.error("Bot instance is not available on message; cannot send ticket reply.")
+            await message.answer("⚠️ پاسخ ثبت شد اما ارسال پیام به کاربر ناموفق بود.")
+    except Exception as e:
+        logger.error(f"Failed to send ticket reply to user {ticket.user.telegram_id}: {e}")
+        await message.answer("⚠️ پاسخ ثبت شد اما ارسال پیام به کاربر با خطا مواجه شد.")
+
+    await state.clear()
+    await message.answer("✅ پاسخ شما برای کاربر ارسال شد.")
+
+    # بازگشت به لیست تیکت‌ها
+    # ساخت یک CallbackQuery مجازی برای فراخوانی مجدد لیست (با استفاده از message)
+    text = "📨 <b>پیامهای پشتیبانی</b>\n\nدر حال بازگشت به لیست..."
+    # بهجای فراخوانی مستقیم، کاربر را با دکمه هدایت میکنیم
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 بازگشت به لیست تیکت‌ها", callback_data="admin_support_tickets")],
+        [InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")],
+    ])
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("adm_tkc_"))
+async def admin_close_ticket(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    ticket_id_str = callback.data.replace("adm_tkc_", "")
+    if not ticket_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    ticket_id = int(ticket_id_str)
+
+    ticket = (
+        await db_session.execute(select(Ticket).where(Ticket.id == ticket_id))
+    ).scalar_one_or_none()
+    if not ticket:
+        await callback.answer("❌ تیکت یافت نشد.", show_alert=True)
+        return
+
+    ticket.status = "closed"
+    await db_session.commit()
+
+    await callback.answer("✅ تیکت بسته شد.", show_alert=True)
+
+    # بازگشت به لیست تیکت‌ها با model_copy
+    new_callback = callback.model_copy(update={"data": "admin_support_tickets"})
+    await admin_support_tickets_list(new_callback, db_session)

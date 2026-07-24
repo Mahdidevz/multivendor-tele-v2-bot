@@ -1,18 +1,24 @@
 import random
+import logging
+import time
+from typing import Any, Dict
 
 from aiogram import F, Router, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import BUTTONS, MESSAGES
-from bot.states import WalletChargeStates
+from bot.states import WalletChargeStates, UserStates
 from core.database.crud import get_or_create_user
-from core.database.models import Transaction, User, Vendor, Plan, Server
+from core.database.models import Transaction, User, Vendor, Plan, Server, Ticket
+from core.services.panel_client import MarzbanClient
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -457,3 +463,288 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
     cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]])
     await message.answer(text, reply_markup=cancel_kb)
     await state.set_state(WalletChargeStates.waiting_for_receipt)
+
+
+# ==========================================
+# 🌟 [جدید] پروفایل کاربر
+# ==========================================
+@router.callback_query(F.data == "user_profile")
+async def process_user_profile(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    # واکشی کاربر بههمراه فروشندهاش
+    stmt = (
+        select(User)
+        .options(selectinload(User.vendor))
+        .where(User.telegram_id == callback.from_user.id)
+    )
+    user = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # شمارش تعداد سرویسهای خریداریشده (تراکنشهای تاییدشده با پلن)
+    count_stmt = select(func.count(Transaction.id)).where(
+        Transaction.user_id == user.id,
+        Transaction.status == "approved",
+        Transaction.plan_id.is_not(None),
+    )
+    total_services = (await db_session.execute(count_stmt)).scalar_one()
+
+    shop_name = user.vendor.name if user.vendor else "نامشخص"
+
+    text = (
+        "👤 <b>پروفایل کاربری</b>\n\n"
+        f"🆔 <b>شناسه تلگرام:</b> <code>{user.telegram_id}</code>\n"
+        f"🏪 <b>فروشگاه:</b> {shop_name}\n"
+        f"💰 <b>موجودی کیف پول:</b> <code>{int(user.wallet_balance):,}</code> تومان\n"
+        f"🛍 <b>تعداد سرویسها:</b> {total_services}\n"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]
+    ])
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+# ==========================================
+# 🌟 [جدید] پشتیبانی / تیکتینگ
+# ==========================================
+@router.callback_query(F.data == "support")
+async def process_support(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    # بررسی وجود کاربر در سیستم
+    stmt = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # ذخیره user_id و vendor_id برای استفاده در هندلر بعدی
+    await state.update_data(ticket_user_id=user.id, ticket_vendor_id=user.vendor_id)
+
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ انصراف", callback_data="back_to_main")]
+    ])
+    text = (
+        "🎧 <b>پشتیبانی</b>\n\n"
+        "لطفاً پیام خود را به صورت متن ارسال کنید.\n"
+        "پیام شما برای پشتیبانی فروشگاه ارسال خواهد شد."
+    )
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text, reply_markup=cancel_kb)
+    await state.set_state(UserStates.waiting_for_support_message)
+    await callback.answer()
+
+
+@router.message(UserStates.waiting_for_support_message)
+async def process_support_message(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    data = await state.get_data()
+    ticket_user_id = data.get("ticket_user_id")
+    ticket_vendor_id = data.get("ticket_vendor_id")
+
+    # گارد: بررسی وجود شناسه‌های لازم
+    if not ticket_user_id or not ticket_vendor_id:
+        await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
+        await state.clear()
+        await cmd_start(message, db_session)
+        return
+
+    message_text = message.text.strip()
+    if not message_text:
+        await message.answer("❌ پیام نمیتواند خالی باشد.")
+        return
+
+    # ساخت تیکت جدید
+    new_ticket = Ticket(
+        user_id=int(ticket_user_id),
+        vendor_id=int(ticket_vendor_id),
+        message_text=message_text,
+        status="pending",
+    )
+    db_session.add(new_ticket)
+    await db_session.commit()
+    await state.clear()
+
+    await message.answer("✅ پیام شما برای پشتیبانی ارسال شد.")
+
+    # بازگشت خودکار به منوی اصلی
+    await cmd_start(message, db_session)
+
+
+# ==========================================
+# 🌟 [جدید] سرویسهای من + مانیتورینگ زنده
+# ==========================================
+@router.callback_query(F.data == "my_services")
+async def process_my_services(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    # واکشی کاربر
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # واکشی تراکنشهای تاییدشده که دارای پلن هستند
+    stmt = (
+        select(Transaction)
+        .options(selectinload(Transaction.plan))
+        .where(
+            Transaction.user_id == user.id,
+            Transaction.status == "approved",
+            Transaction.plan_id.is_not(None),
+        )
+        .order_by(Transaction.created_at.desc())
+    )
+    transactions = (await db_session.execute(stmt)).scalars().all()
+
+    if not transactions:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]
+        ])
+        if isinstance(callback.message, types.Message):
+            await callback.message.edit_text(
+                "📦 <b>سرویسهای من</b>\n\nشما هنوز هیچ سرویسی خریداری نکرده‌اید.",
+                reply_markup=kb
+            )
+        await callback.answer()
+        return
+
+    builder = InlineKeyboardBuilder()
+    for tx in transactions:
+        plan_title = tx.plan.title if tx.plan else "نامشخص"
+        builder.button(text=f"📦 {plan_title}", callback_data=f"usr_srv_{tx.id}")
+    builder.button(text="🔙 بازگشت به منوی اصلی", callback_data="back_to_main")
+    builder.adjust(1)
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(
+            "📦 <b>سرویسهای من</b>\n\nبرای مشاهده جزئیات و وضعیت زنده، یک سرویس را انتخاب کنید:",
+            reply_markup=builder.as_markup()
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("usr_srv_"))
+async def process_service_monitoring(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    tx_id_str = callback.data.replace("usr_srv_", "")
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    tx_id = int(tx_id_str)
+
+    # واکشی تراکنش بههمراه پلن و سرور
+    stmt = (
+        select(Transaction)
+        .options(
+            selectinload(Transaction.user),
+            selectinload(Transaction.plan).selectinload(Plan.server),
+        )
+        .where(Transaction.id == tx_id)
+    )
+    tx = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not tx or not tx.user or not tx.plan or not tx.plan.server:
+        await callback.answer("❌ سرویس یافت نشد.", show_alert=True)
+        return
+
+    # بررسی مالکیت سرویس
+    if tx.user.telegram_id != callback.from_user.id:
+        await callback.answer("❌ دسترسی غیرمجاز.", show_alert=True)
+        return
+
+    server: Server = tx.plan.server
+    username = f"U_{tx.user.telegram_id}_{tx.id}"
+
+    # فراخوانی API برای گرفتن وضعیت زنده کاربر
+    client = MarzbanClient(
+        base_url=server.panel_url,
+        username=server.username,
+        password=server.password,
+    )
+    api_data: Dict[str, Any] | None = None
+    try:
+        api_data = await client.get_user(username=username)
+    except Exception as e:
+        logger.error(f"Live monitoring failed for tx {tx_id}: {e}")
+        api_data = None
+    finally:
+        await client.close()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"usr_srv_{tx.id}")],
+        [InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="my_services")],
+    ])
+
+    if api_data is None:
+        text = (
+            "📡 <b>مانیتورینگ سرویس</b>\n\n"
+            f"🛍 <b>سرویس:</b> {tx.plan.title if tx.plan else 'نامشخص'}\n"
+            f"🖥 <b>سرور:</b> {server.name}\n\n"
+            "❌ <b>سرور در حال حاضر قابل دسترسی نیست.</b>\n"
+            "لطفاً بعداً مجدداً تلاش کنید."
+        )
+    else:
+        # استخراج مقادیر از پاسخ API (با گارد روی مقادیر ممکن None/غیرموجود)
+        data_limit = api_data.get("data_limit") or 0  # بایت
+        used_traffic = api_data.get("used_traffic") or 0  # بایت
+        expire_ts = api_data.get("expire") or 0
+        status = api_data.get("status") or "unknown"
+
+        # محاسبه حجمها به GB
+        total_gb = data_limit / (1024 ** 3) if data_limit else 0.0
+        used_gb = used_traffic / (1024 ** 3) if used_traffic else 0.0
+        remaining_gb = max(total_gb - used_gb, 0.0) if data_limit else 0.0
+
+        # محاسبه روزهای باقیمانده
+        remaining_days = 0
+        if expire_ts:
+            remaining_seconds = int(expire_ts) - int(time.time())
+            remaining_days = max(remaining_seconds // 86400, 0)
+
+        # قالببندی خروجی
+        if data_limit > 0:
+            total_text = f"{total_gb:.2f} GB"
+            remaining_text = f"{remaining_gb:.2f} GB"
+        else:
+            total_text = "نامحدود ∞"
+            remaining_text = "نامحدود ∞"
+
+        if expire_ts:
+            days_text = f"{remaining_days} روز"
+        else:
+            days_text = "نامحدود ∞"
+
+        status_emoji = "🟢" if status == "active" else "🔴"
+
+        text = (
+            "📡 <b>مانیتورینگ زنده سرویس</b>\n\n"
+            f"🛍 <b>سرویس:</b> {tx.plan.title}\n"
+            f"🖥 <b>سرور:</b> {server.name}\n"
+            f"{status_emoji} <b>وضعیت کاربر:</b> {status}\n"
+            "〰️〰️〰️〰️〰️〰️〰️\n"
+            f"💽 <b>حجم کل:</b> {total_text}\n"
+            f"📊 <b>حجم مصرفشده:</b> {used_gb:.2f} GB\n"
+            f"✨ <b>حجم باقیمانده:</b> {remaining_text}\n"
+            f"⏳ <b>روزهای باقیمانده:</b> {days_text}\n"
+        )
+
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
