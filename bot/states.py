@@ -14,8 +14,20 @@ class UserStates(StatesGroup):
 
 
 class AdminTicketStates(StatesGroup):
-    """🌟 [جدید] وضعیت‌های مربوط به پاسخ به تیکت توسط ادمین."""
+    """🌟 [جدید] وضعیتهای مربوط به پاسخ به تیکت توسط ادمین."""
     waiting_for_ticket_reply = State()
+
+
+# 🌟 [جدید] وضعیتهای مدیریت مشتریان توسط ادمین
+class AdminCustomerStates(StatesGroup):
+    waiting_for_broadcast_message = State()
+    waiting_for_customer_search = State()
+    waiting_for_wallet_charge_amount = State()
+
+
+# 🌟 [جدید] وضعیتهای تنظیمات عضویت اجباری (Force Join)
+class AdminForceJoinStates(StatesGroup):
+    waiting_for_channel_data = State()
 
 class AddServerStates(StatesGroup):
     waiting_for_name = State()

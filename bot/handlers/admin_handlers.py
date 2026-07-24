@@ -1,8 +1,10 @@
 import os
 import io
 import time
+import asyncio
 import logging
-from typing import Sequence
+from datetime import datetime
+from typing import Any, Dict, Sequence
 
 import qrcode
 from aiogram import Router, types, F
@@ -14,8 +16,8 @@ from sqlalchemy import select, or_, update, func
 from sqlalchemy.orm import selectinload
 from aiogram.fsm.context import FSMContext
 
-from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates, AdminTicketStates
-from core.database.models import Plan, Vendor, Transaction, Server, VendorServer, Ticket
+from bot.states import AdminStates, AddPlanStates, EditPlanStates, AddServerStates, AdminTicketStates, AdminCustomerStates, AdminForceJoinStates
+from core.database.models import Plan, Vendor, Transaction, Server, VendorServer, Ticket, ForceJoinChannel, User
 from core.services.panel_client import MarzbanClient
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,10 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
         [
             InlineKeyboardButton(text="🛍 مدیریت پلنها", callback_data="admin_manage_plans"),
             InlineKeyboardButton(text=tickets_label, callback_data="admin_support_tickets")
+        ],
+        [
+            InlineKeyboardButton(text="👥 مشتریان من", callback_data="admin_my_customers"),
+            InlineKeyboardButton(text="🔒 عضویت اجباری", callback_data="admin_force_join"),
         ],
     ]
 
@@ -1521,6 +1527,672 @@ async def admin_close_ticket(callback: types.CallbackQuery, db_session: AsyncSes
 
     await callback.answer("✅ تیکت بسته شد.", show_alert=True)
 
-    # بازگشت به لیست تیکت‌ها با model_copy
+    # بازگشت به لیست تیکتها با model_copy
     new_callback = callback.model_copy(update={"data": "admin_support_tickets"})
     await admin_support_tickets_list(new_callback, db_session)
+
+
+# ==========================================
+# 🌟 [جدید] تنظیمات عضویت اجباری (Force-Join)
+# ==========================================
+@router.callback_query(F.data == "admin_force_join")
+async def admin_force_join_menu(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    stmt = select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    channels = (
+        await db_session.execute(
+            select(ForceJoinChannel)
+            .where(ForceJoinChannel.vendor_id == vendor.id)
+            .order_by(ForceJoinChannel.id)
+        )
+    ).scalars().all()
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for ch in channels:
+        kb_rows.append([
+            InlineKeyboardButton(text=f"📢 {ch.title}", url=ch.url),
+            InlineKeyboardButton(text="🗑 حذف", callback_data=f"fjc_del_{ch.id}"),
+        ])
+    kb_rows.append([InlineKeyboardButton(text="➕ افزودن کانال", callback_data="fjc_add")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
+
+    if channels:
+        text = (
+            "🔒 <b>تنظیمات عضویت اجباری</b>\n\n"
+            "کانالهای فعال زیر را کاربران باید عضو شوند تا تست رایگان دریافت کنند:"
+        )
+    else:
+        text = "🔒 <b>تنظیمات عضویت اجباری</b>\n\nهیچ کانالی ثبت نشده است."
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "fjc_add")
+async def admin_force_join_add(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    await state.set_state(AdminForceJoinStates.waiting_for_channel_data)
+    text = (
+        "➕ <b>افزودن کانال جدید</b>\n\n"
+        "لطفاً اطلاعات کانال را با این فرمت ارسال کنید:\n\n"
+        "<code>@channel_id - https://t.me/... - عنوان کانال</code>\n\n"
+        "⚠️ توجه: ربات باید مدیر (Admin) در آن کانال باشد تا بتواند عضویت کاربران را بررسی کند."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="admin_force_join")
+    ]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.message(AdminForceJoinStates.waiting_for_channel_data)
+async def process_force_join_channel_data(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    parts = message.text.split(" - ")
+    if len(parts) != 3:
+        await message.answer(
+            "❌ فرمت نامعتبر. مثال صحیح:\n<code>@channel - https://t.me/... - عنوان</code>"
+        )
+        return
+
+    chat_id = parts[0].strip()
+    url = parts[1].strip()
+    title = parts[2].strip()
+
+    if not chat_id or not url.startswith("http"):
+        await message.answer(
+            "❌ فرمت نامعتبر. مثال صحیح:\n<code>@channel - https://t.me/... - عنوان</code>"
+        )
+        return
+
+    stmt = select(Vendor).where(Vendor.telegram_id == message.from_user.id)
+    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
+
+    channel = ForceJoinChannel(vendor_id=vendor.id, chat_id=chat_id, url=url, title=title)
+    db_session.add(channel)
+    await db_session.commit()
+
+    await message.answer(f"✅ کانال «{title}» با موفقیت اضافه شد.")
+    await state.clear()
+
+    # نمایش منوی عضویت اجباری به صورت inline (چون این هندلر message-based است)
+    channels = (
+        await db_session.execute(
+            select(ForceJoinChannel)
+            .where(ForceJoinChannel.vendor_id == vendor.id)
+            .order_by(ForceJoinChannel.id)
+        )
+    ).scalars().all()
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for ch in channels:
+        kb_rows.append([
+            InlineKeyboardButton(text=f"📢 {ch.title}", url=ch.url),
+            InlineKeyboardButton(text="🗑 حذف", callback_data=f"fjc_del_{ch.id}"),
+        ])
+    kb_rows.append([InlineKeyboardButton(text="➕ افزودن کانال", callback_data="fjc_add")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
+
+    if channels:
+        menu_text = (
+            "🔒 <b>تنظیمات عضویت اجباری</b>\n\n"
+            "کانالهای فعال زیر را کاربران باید عضو شوند تا تست رایگان دریافت کنند:"
+        )
+    else:
+        menu_text = "🔒 <b>تنظیمات عضویت اجباری</b>\n\nهیچ کانالی ثبت نشده است."
+
+    await message.answer(menu_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data.startswith("fjc_del_"))
+async def admin_force_join_delete(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    channel_id_str = callback.data.replace("fjc_del_", "")
+    if not channel_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    channel_id = int(channel_id_str)
+
+    channel = (
+        await db_session.execute(select(ForceJoinChannel).where(ForceJoinChannel.id == channel_id))
+    ).scalar_one_or_none()
+    if not channel:
+        await callback.answer("❌ کانال یافت نشد.", show_alert=True)
+        return
+
+    await db_session.delete(channel)
+    await db_session.commit()
+
+    await callback.answer("✅ حذف شد.", show_alert=True)
+
+    # بازگشت به منوی عضویت اجباری با model_copy
+    new_callback = callback.model_copy(update={"data": "admin_force_join"})
+    await admin_force_join_menu(new_callback, db_session)
+
+
+# ==========================================
+# 🌟 [جدید] مدیریت مشتریان (Customer Management)
+# ==========================================
+@router.callback_query(F.data == "admin_my_customers")
+async def admin_my_customers(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    stmt = select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 لیست مشتریان", callback_data="adm_cust_list_1")],
+        [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adm_cust_broadcast")],
+        [InlineKeyboardButton(text="🔍 جستجوی مشتری", callback_data="adm_cust_search")],
+        [InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")],
+    ])
+    text = "👥 <b>مدیریت مشتریان</b>\n\nلطفاً یک گزینه را انتخاب کنید:"
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_cust_list_"))
+async def admin_customers_list(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    page_str = callback.data.replace("adm_cust_list_", "")
+    page = int(page_str) if page_str.isdigit() else 1
+    if page < 1:
+        page = 1
+
+    stmt = select(Vendor).where(Vendor.telegram_id == callback.from_user.id)
+    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    users = (
+        await db_session.execute(
+            select(User)
+            .where(User.vendor_id == vendor.id)
+            .order_by(User.created_at.desc())
+            .limit(10)
+            .offset((page - 1) * 10)
+        )
+    ).scalars().all()
+
+    total = await db_session.scalar(
+        select(func.count(User.id)).where(User.vendor_id == vendor.id)
+    )
+    total = int(total or 0)
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if not users:
+        text = "👥 <b>لیست مشتریان</b>\n\nهیچ مشتریای یافت نشد."
+        kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_my_customers")])
+    else:
+        text = f"👥 <b>لیست مشتریان</b>\n\nصفحه {page} — برای مشاهده جزئیات روی یک کاربر کلیک کنید:"
+        for u in users:
+            kb_rows.append([
+                InlineKeyboardButton(text=f"👤 {u.telegram_id}", callback_data=f"adm_cust_det_{u.id}")
+            ])
+
+        # کنترلهای صفحه‌بندی
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"adm_cust_list_{page - 1}"))
+        if total > page * 10:
+            nav_row.append(InlineKeyboardButton(text="➡️ بعدی", callback_data=f"adm_cust_list_{page + 1}"))
+        if nav_row:
+            kb_rows.append(nav_row)
+
+        kb_rows.append([InlineKeyboardButton(text="🔍 جستجو", callback_data="adm_cust_search")])
+        kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_my_customers")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm_cust_broadcast")
+async def admin_broadcast_start(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    await state.set_state(AdminCustomerStates.waiting_for_broadcast_message)
+    text = "📢 <b>پیام همگانی</b>\n\nلطفاً متن پیام خود را ارسال کنید تا برای تمام مشتریان شما ارسال شود:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="admin_my_customers")
+    ]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.message(AdminCustomerStates.waiting_for_broadcast_message)
+async def process_broadcast_message(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    stmt = select(Vendor).where(Vendor.telegram_id == message.from_user.id)
+    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
+
+    users = (
+        await db_session.execute(select(User).where(User.vendor_id == vendor.id))
+    ).scalars().all()
+
+    await message.answer("⏳ در حال ارسال...")
+
+    sent = 0
+    failed = 0
+    bot = message.bot
+    if bot is None:
+        await state.clear()
+        await message.answer("❌ ربات در دسترس نیست.")
+        return
+    for u in users:
+        try:
+            await bot.send_message(chat_id=u.telegram_id, text=message.text)
+            sent += 1
+        except TelegramBadRequest:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await state.clear()
+    await message.answer(f"✅ ارسال همگانی کامل شد.\n\n📤 موفق: {sent}\n❌ ناموفق: {failed}")
+
+    # نمایش منوی مدیریت مشتریان به صورت inline (چون این هندلر message-based است)
+    menu_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 لیست مشتریان", callback_data="adm_cust_list_1")],
+        [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adm_cust_broadcast")],
+        [InlineKeyboardButton(text="🔍 جستجوی مشتری", callback_data="adm_cust_search")],
+        [InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")],
+    ])
+    await message.answer("👥 <b>مدیریت مشتریان</b>\n\nلطفاً یک گزینه را انتخاب کنید:", reply_markup=menu_kb)
+
+
+@router.callback_query(F.data == "adm_cust_search")
+async def admin_search_start(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    await state.set_state(AdminCustomerStates.waiting_for_customer_search)
+    text = "🔍 <b>جستجوی مشتری</b>\n\nلطفاً شناسه تلگرام (عددی) یا نام کاربر را ارسال کنید:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="admin_my_customers")
+    ]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.message(AdminCustomerStates.waiting_for_customer_search)
+async def process_customer_search(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    stmt = select(Vendor).where(Vendor.telegram_id == message.from_user.id)
+    vendor = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not vendor:
+        await message.answer("❌ فروشنده یافت نشد.")
+        await state.clear()
+        return
+
+    query_text = message.text.strip()
+    if not query_text.isdigit():
+        # مدل User فیلد نام ندارد — فقط جستجوی عددی شناسه تلگرام پشتیبانی می‌شود
+        await message.answer("❌ برای جستجو شناسه تلگرام عددی ارسال کنید.")
+        return
+
+    telegram_id = int(query_text)
+    users = (
+        await db_session.execute(
+            select(User)
+            .where(User.vendor_id == vendor.id, User.telegram_id == telegram_id)
+            .limit(10)
+        )
+    ).scalars().all()
+
+    await state.clear()
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if not users:
+        text = "🔍 <b>نتایج جستجو</b>\n\nهیچ کاربری با این شناسه یافت نشد."
+    else:
+        text = "🔍 <b>نتایج جستجو</b>\n\nبرای مشاهده جزئیات روی کاربر کلیک کنید:"
+        for u in users:
+            kb_rows.append([
+                InlineKeyboardButton(text=f"👤 {u.telegram_id}", callback_data=f"adm_cust_det_{u.id}")
+            ])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data="admin_my_customers")])
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@router.callback_query(F.data.startswith("adm_cust_det_"))
+async def admin_customer_detail(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_det_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
+        return
+
+    text = (
+        "👤 <b>جزئیات مشتری</b>\n\n"
+        f"🆔 شناسه تلگرام: <code>{user.telegram_id}</code>\n"
+        f"📅 تاریخ عضویت: {user.created_at.strftime('%Y-%m-%d')}\n"
+        f"💰 موجودی کیف پول: <code>{int(user.wallet_balance):,}</code> تومان"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 شارژ دستی کیف پول", callback_data=f"adm_cust_chg_{user.id}")],
+        [InlineKeyboardButton(text="🗂 سرویسهای مشتری", callback_data=f"adm_cust_srv_{user.id}")],
+        [InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="adm_cust_list_1")],
+    ])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_cust_chg_"))
+async def admin_wallet_charge_start(callback: types.CallbackQuery, state: FSMContext):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_chg_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(AdminCustomerStates.waiting_for_wallet_charge_amount)
+
+    text = (
+        "💰 <b>شارژ دستی کیف پول</b>\n\n"
+        "لطفاً مبلغ را به تومان ارسال کنید (مثبت برای افزایش، منفی برای کسر):\n"
+        "مثال: <code>50000</code> یا <code>-20000</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ لغو", callback_data="admin_my_customers")
+    ]])
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+@router.message(AdminCustomerStates.waiting_for_wallet_charge_amount)
+async def process_wallet_charge_amount(message: types.Message, state: FSMContext, db_session: AsyncSession):
+    if not message.text or not message.from_user:
+        return
+
+    try:
+        amount = float(message.text.strip())
+    except (ValueError, TypeError):
+        await message.answer("❌ مبلغ نامعتبر.")
+        return
+
+    data = await state.get_data()
+    target_user_id = data.get("target_user_id")
+    if not target_user_id:
+        await state.clear()
+        return
+
+    user = (
+        await db_session.execute(select(User).where(User.id == int(target_user_id)))
+    ).scalar_one_or_none()
+    if not user:
+        await state.clear()
+        await message.answer("❌ کاربر یافت نشد.")
+        return
+
+    user.wallet_balance += amount
+    await db_session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ موجودی کاربر {user.telegram_id} با موفقیت تغییر کرد.\n"
+        f"💰 موجودی جدید: <code>{int(user.wallet_balance):,}</code> تومان"
+    )
+    try:
+        bot = message.bot
+        if bot is not None:
+            await bot.send_message(
+                chat_id=user.telegram_id,
+                text=(
+                    f"💰 موجودی کیف پول شما تغییر کرد.\n"
+                    f"مبلغ: <code>{int(amount):,}</code> تومان\n"
+                    f"موجودی جدید: <code>{int(user.wallet_balance):,}</code> تومان"
+                ),
+            )
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("adm_cust_srv_"))
+async def admin_customer_services(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    user_id_str = callback.data.replace("adm_cust_srv_", "")
+    if not user_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    user_id = int(user_id_str)
+
+    user = (
+        await db_session.execute(select(User).where(User.id == user_id))
+    ).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
+        return
+
+    transactions = (
+        await db_session.execute(
+            select(Transaction)
+            .options(selectinload(Transaction.plan))
+            .where(Transaction.user_id == user.id, Transaction.plan_id.is_not(None), Transaction.status == "approved")
+            .order_by(Transaction.created_at.desc())
+        )
+    ).scalars().all()
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if not transactions:
+        text = "🗂 این کاربر هنوز سرویسی خریداری نکرده است."
+    else:
+        text = "🗂 <b>سرویسهای مشتری</b>\n\nبرای مشاهده جزئیات زنده روی یک سرویس کلیک کنید:"
+        for tx in transactions:
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=f"📦 {tx.plan.title if tx.plan else 'نامشخص'}",
+                    callback_data=f"usr_srv_{tx.id}",
+                )
+            ])
+    kb_rows.append([InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"adm_cust_det_{user.id}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer()
+
+
+# ==========================================
+# 🌟 [جدید] مانیتورینگ زنده سرویس مشتری (Admin-side)
+# ==========================================
+@router.callback_query(F.data.startswith("usr_srv_"))
+async def admin_customer_service_monitor(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+    tx_id_str = callback.data.replace("usr_srv_", "")
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    tx_id = int(tx_id_str)
+
+    stmt = (
+        select(Transaction)
+        .options(
+            selectinload(Transaction.user),
+            selectinload(Transaction.plan).selectinload(Plan.server),
+        )
+        .where(Transaction.id == tx_id)
+    )
+    tx = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not tx or not tx.user or not tx.plan or not tx.plan.server:
+        await callback.answer("❌ سرویس یافت نشد.", show_alert=True)
+        return
+
+    server: Server = tx.plan.server
+    username = f"U_{tx.user.telegram_id}_{tx.id}"
+
+    client = MarzbanClient(base_url=server.panel_url, username=server.username, password=server.password)
+    api_data: Dict[str, Any] | None = None
+    try:
+        api_data = await client.get_user(username=username)
+    except Exception as e:
+        logger.error(f"Admin live monitoring failed for tx {tx_id}: {e}")
+        api_data = None
+    finally:
+        await client.close()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"usr_srv_{tx.id}")],
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data=f"adm_cust_srv_{tx.user.id}")],
+    ])
+
+    if api_data is None:
+        text = (
+            "📡 <b>مانیتورینگ سرویس</b>\n\n"
+            f"🛍 <b>سرویس:</b> {tx.plan.title if tx.plan else 'نامشخص'}\n"
+            f"🖥 <b>سرور:</b> {server.name}\n\n"
+            "❌ <b>سرور در حال حاضر قابل دسترسی نیست.</b>\n"
+            "لطفاً بعداً مجدداً تلاش کنید."
+        )
+    else:
+        data_limit = api_data.get("data_limit") or 0
+        used_traffic = api_data.get("used_traffic") or 0
+        expire_val = api_data.get("expire")
+        status = api_data.get("status") or "unknown"
+
+        total_gb = data_limit / (1024 ** 3) if data_limit else 0.0
+        used_gb = used_traffic / (1024 ** 3) if used_traffic else 0.0
+        remaining_gb = max(total_gb - used_gb, 0.0) if data_limit else 0.0
+
+        remaining_days = 0
+        has_expire = False
+        if expire_val:
+            try:
+                if isinstance(expire_val, str) and "T" in expire_val:
+                    dt = datetime.fromisoformat(expire_val.replace("Z", "+00:00"))
+                    expire_ts = int(dt.timestamp())
+                else:
+                    expire_ts = int(expire_val)
+                remaining_seconds = expire_ts - int(time.time())
+                remaining_days = max(remaining_seconds // 86400, 0)
+                has_expire = True
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse expire value '{expire_val}': {e}")
+                has_expire = False
+
+        if data_limit > 0:
+            total_text = f"{total_gb:.2f} GB"
+            remaining_text = f"{remaining_gb:.2f} GB"
+        else:
+            total_text = "نامحدود ∞"
+            remaining_text = "نامحدود ∞"
+
+        if has_expire:
+            days_text = f"{remaining_days} روز"
+        else:
+            days_text = "نامحدود ∞"
+
+        status_emoji = "🟢" if status == "active" else "🔴"
+
+        text = (
+            "📡 <b>مانیتورینگ زنده سرویس</b>\n\n"
+            f"🛍 <b>سرویس:</b> {tx.plan.title}\n"
+            f"🖥 <b>سرور:</b> {server.name}\n"
+            f"{status_emoji} <b>وضعیت کاربر:</b> {status}\n"
+            "〰️〰️〰️〰️〰️〰️〰️\n"
+            f"💽 <b>حجم کل:</b> {total_text}\n"
+            f"📊 <b>حجم مصرفشده:</b> {used_gb:.2f} GB\n"
+            f"✨ <b>حجم باقیمانده:</b> {remaining_text}\n"
+            f"⏳ <b>روزهای باقیمانده:</b> {days_text}\n"
+        )
+
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+    await callback.answer("🔄 اطلاعات بروزرسانی شد")

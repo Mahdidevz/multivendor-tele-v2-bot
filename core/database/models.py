@@ -28,8 +28,11 @@ class Vendor(Base):
     # 🌟 [جدید] رابطه: هر فروشنده میتواند سرورهای اختصاصی خودش را داشته باشد
     servers = relationship("Server", back_populates="vendor")
 
-    # 🌟 [جدید] رابطه: تیکت‌های پشتیبانی دریافتشده توسط این فروشنده
+    # 🌟 [جدید] رابطه: تیکتهای پشتیبانی دریافتشده توسط این فروشنده
     tickets = relationship("Ticket", back_populates="vendor", foreign_keys="Ticket.vendor_id")
+
+    # 🌟 [جدید] رابطه: کانالهای عضویت اجباری این فروشنده
+    force_join_channels = relationship("ForceJoinChannel", back_populates="vendor", cascade="all, delete-orphan")
 
 
 class Server(Base):
@@ -94,11 +97,27 @@ class User(Base):
     vendor_id: Mapped[int] = mapped_column(ForeignKey('vendors.id'))
     wallet_balance: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # 🌟 [جدید] آیا کاربر قبلاً کانفیگ تست رایگان دریافت کرده است؟ (هر کاربر فقط یک بار)
+    has_received_test: Mapped[bool] = mapped_column(Boolean, default=False)
     vendor = relationship("Vendor", back_populates="users")
     transactions = relationship("Transaction", back_populates="user")
 
-    # 🌟 [جدید] رابطه: تیکت‌های پشتیبانی ارسالشده توسط این کاربر
+    # 🌟 [جدید] رابطه: تیکتهای پشتیبانی ارسالشده توسط این کاربر
     tickets = relationship("Ticket", back_populates="user")
+
+
+# 🌟 [جدید] مدل کانالهای عضویت اجباری هر فروشنده (Force Join)
+class ForceJoinChannel(Base):
+    """کانالهایی که کاربران باید پیش از دریافت تست رایگان در آنها عضو شوند."""
+    __tablename__ = 'force_join_channels'
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vendor_id: Mapped[int] = mapped_column(ForeignKey('vendors.id', ondelete='CASCADE'))
+    chat_id: Mapped[str] = mapped_column(String(100))   # مثال: "@mychannel" یا "-1001234567890"
+    title: Mapped[str] = mapped_column(String(255))
+    url: Mapped[str] = mapped_column(String(255))        # لینک دعوت
+
+    vendor = relationship("Vendor", back_populates="force_join_channels")
 
 
 class Transaction(Base):

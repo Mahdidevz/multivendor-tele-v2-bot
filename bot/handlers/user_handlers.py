@@ -1,23 +1,25 @@
+import io
 import random
 import logging
 import time
 from datetime import datetime
 from typing import Any, Dict
 
+import qrcode
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import BUTTONS, MESSAGES
 from bot.states import WalletChargeStates, UserStates
 from core.database.crud import get_or_create_user
-from core.database.models import Transaction, User, Vendor, Plan, Server, Ticket
+from core.database.models import Transaction, User, Vendor, Plan, Server, Ticket, ForceJoinChannel, VendorServer
 from core.services.panel_client import MarzbanClient
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,7 @@ async def cmd_start(message: types.Message, db_session: AsyncSession):
                 InlineKeyboardButton(text=BUTTONS["user_profile"], callback_data="user_profile"),
                 InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
             ],
+            [InlineKeyboardButton(text=BUTTONS["free_test"], callback_data="free_test_start")],
         ]
     )
     await message.answer(text=welcome_text, reply_markup=main_menu_keyboard)
@@ -80,6 +83,7 @@ async def process_back_to_main(callback: types.CallbackQuery, db_session: AsyncS
                 InlineKeyboardButton(text=BUTTONS["user_profile"], callback_data="user_profile"),
                 InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
             ],
+            [InlineKeyboardButton(text=BUTTONS["free_test"], callback_data="free_test_start")],
         ]
     )
 
@@ -767,3 +771,280 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
             # 🌟 اگر محتوا تغییر نکرده باشد (مثلاً حجم همان است) تلگرام خطا میدهد؛ نادیده بگیر
             pass
     await callback.answer("🔄 اطلاعات بروزرسانی شد")
+
+
+# ==========================================
+# 🎁 [جدید] دریافت تست رایگان + Force-Join
+# ==========================================
+
+# --- مرحله ۱: بررسی عضویت اجباری در کانالها ---
+@router.callback_query(F.data == "free_test_start")
+async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSession):
+    # گاردهای ایمنی نوع
+    if not callback.from_user or not callback.data:
+        await callback.answer()
+        return
+
+    # واکشی کاربر
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # واکشی کانالهای عضویت اجباری این فروشنده
+    stmt_channels = select(ForceJoinChannel).where(ForceJoinChannel.vendor_id == user.vendor_id)
+    channels = (await db_session.execute(stmt_channels)).scalars().all()
+
+    # گارد روی bot (در تایپ aiogram ممکن است None باشد)
+    bot = callback.bot
+    if bot is None:
+        await callback.answer("❌ خطای داخلی رخ داده است.", show_alert=True)
+        return
+
+    # اگر کانالی تعریف نشده → مستقیم به مرحله ۲ (نمایش سرورها)
+    if not channels:
+        new_callback = callback.model_copy(update={"data": "free_test_servers"})
+        await free_test_show_servers(new_callback, db_session)
+        return
+
+    # بررسی عضویت کاربر در هر کانال
+    unjoined: list[ForceJoinChannel] = []
+    for ch in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=ch.chat_id, user_id=user.telegram_id)
+            status = member.status
+            if status not in ("member", "administrator", "creator"):
+                unjoined.append(ch)
+        except TelegramBadRequest:
+            # بات اخراج شده/ادمین نیست → محتاطانه «عضو نیست»
+            unjoined.append(ch)
+        except Exception as e:
+            logger.warning(f"Force-join membership check failed for channel {ch.chat_id}: {e}")
+            unjoined.append(ch)
+
+    # اگر در همه کانالها عضو بود → مرحله ۲
+    if not unjoined:
+        new_callback = callback.model_copy(update={"data": "free_test_servers"})
+        await free_test_show_servers(new_callback, db_session)
+        return
+
+    # نمایش لیست کانالهای عضو نشده + دکمه بررسی مجدد
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for ch in unjoined:
+        kb_rows.append([InlineKeyboardButton(text=ch.title, url=ch.url)])
+    kb_rows.append([InlineKeyboardButton(text="✅ بررسی مجدد عضویت", callback_data="free_test_start")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    text = "🔒 برای دریافت تست رایگان، ابتدا در کانالهای زیر عضو شوید:"
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb)
+        except TelegramBadRequest:
+            pass
+
+    await callback.answer()
+
+
+# --- مرحله ۲: بررسی واجلبودن + نمایش لیست سرورها ---
+@router.callback_query(F.data == "free_test_servers")
+async def free_test_show_servers(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user or not callback.data:
+        await callback.answer()
+        return
+
+    # واکشی کاربر
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # بررسی اینکه آیا قبلاً تست دریافت کرده است؟
+    if user.has_received_test:
+        await callback.answer("❌ شما قبلاً سرویس تست دریافت کردهاید.", show_alert=True)
+        return
+
+    # واکشی سرورهای فعال در دسترس این فروشنده (owner یا shared)
+    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == user.vendor_id)
+    stmt_servers = select(Server).where(
+        or_(Server.vendor_id == user.vendor_id, Server.id.in_(shared_subq)),
+        Server.is_active == True,
+    )
+    servers = (await db_session.execute(stmt_servers)).scalars().all()
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=BUTTONS["back_to_main"], callback_data="back_to_main")]
+    ])
+
+    if not servers:
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.edit_text(
+                    "❌ در حال حاضر سرور فعالی برای تست موجود نیست.",
+                    reply_markup=back_kb
+                )
+            except TelegramBadRequest:
+                pass
+        await callback.answer()
+        return
+
+    # ساخت دکمههای سرورها
+    builder = InlineKeyboardBuilder()
+    for srv in servers:
+        builder.button(text=f"🌍 {srv.name}", callback_data=f"req_test_{srv.id}")
+    builder.button(text=BUTTONS["back_to_main"], callback_data="back_to_main")
+    builder.adjust(1)
+
+    text = (
+        "🎁 <b>دریافت تست رایگان</b>\n\n"
+        "لطفاً سرور مورد نظر خود را انتخاب کنید:\n\n"
+        "📦 حجم تست: 75 مگابایت\n"
+        "⏳ مدت: ۱ روز\n"
+        "👥 کاربر همزمان: ۱"
+    )
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(text=text, reply_markup=builder.as_markup())
+        except TelegramBadRequest:
+            pass
+
+    await callback.answer()
+
+
+# --- مرحله ۳: ساخت کانفیگ تست ---
+@router.callback_query(F.data.startswith("req_test_"))
+async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user or not callback.data:
+        await callback.answer()
+        return
+
+    # پارس شناسه سرور
+    server_id_str = callback.data.replace("req_test_", "")
+    if not server_id_str.isdigit():
+        await callback.answer("❌ شناسه سرور نامعتبر است.", show_alert=True)
+        return
+    server_id = int(server_id_str)
+
+    # واکشی کاربر
+    stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
+    user = (await db_session.execute(stmt_user)).scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
+        return
+
+    # 🌟 بررسی مجدد (محافظ در برابر رقابت/race-condition)
+    if user.has_received_test:
+        await callback.answer("❌ شما قبلاً تست دریافت کردهاید.", show_alert=True)
+        return
+
+    # واکشی سرور
+    stmt_server = select(Server).where(Server.id == server_id)
+    server = (await db_session.execute(stmt_server)).scalar_one_or_none()
+    if not server or not server.is_active:
+        await callback.answer("❌ سرور مورد نظر یافت نشد یا غیرفعال است.", show_alert=True)
+        return
+
+    # توقف اسپینر تلگرام
+    await callback.answer("⏳ در حال ساخت کانفیگ تست...")
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=BUTTONS["back_to_main"], callback_data="back_to_main")]
+    ])
+
+    # گارد روی bot
+    bot = callback.bot
+    if bot is None:
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.edit_text(
+                    "❌ خطای داخلی رخ داده است.",
+                    reply_markup=back_kb
+                )
+            except TelegramBadRequest:
+                pass
+        return
+
+    # پارامترهای کانفیگ تست
+    username = f"TEST_{user.telegram_id}_{int(time.time())}"
+    data_limit_bytes = 75 * 1024 * 1024  # 75 MB
+    expire_iso = str(int(time.time()) + 86400)  # ۱ روز
+    hwid_limit = 1
+
+    client = MarzbanClient(
+        base_url=server.panel_url,
+        username=server.username,
+        password=server.password,
+    )
+
+    api_result: Dict[str, Any] | None = None
+    sub_url = ""
+    try:
+        await client.login()
+        api_result = await client.create_user(
+            username=username,
+            data_limit_bytes=data_limit_bytes,
+            expire_iso=expire_iso,
+            hwid_limit=hwid_limit,
+        )
+        if api_result:
+            sub_url = str(api_result.get("subscription_url", ""))
+    except Exception as e:
+        logger.error(f"Free test create_user failed for user {user.telegram_id} on server {server.id}: {e}")
+        api_result = None
+    finally:
+        await client.close()
+
+    # 🎁 موفقیت: ارسال QR + ثبت در دیتابیس
+    if api_result and sub_url:
+        user.has_received_test = True
+        await db_session.commit()
+
+        caption = (
+            "🎁 <b>کانفیگ تست شما ساخته شد!</b>\n\n"
+            f"🖥 سرور: {server.name}\n"
+            "💽 حجم: 75 مگابایت\n"
+            "⏳ اعتبار: ۱ روز\n"
+            "👥 کاربر همزمان: ۱\n\n"
+            "🔗 <b>لینک اشتراک:</b>\n"
+            f"<code>{sub_url}</code>\n\n"
+            "💡 لینک بالا را در برنامه VPN خود وارد کنید."
+        )
+
+        # ارسال QR code (همان الگوی admin_handlers.py)
+        try:
+            import qrcode.constants as _qr_constants  # type: ignore[attr-defined]
+            qr = qrcode.QRCode(version=1, error_correction=_qr_constants.ERROR_CORRECT_M, box_size=10, border=4)
+            qr.add_data(sub_url)
+            qr.make(fit=True)
+            qr_image = qr.make_image(fill_color="black", back_color="white")
+            stream = io.BytesIO()
+            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
+            stream.seek(0)
+            qr_file = BufferedInputFile(stream.read(), filename="test_sub_qr.png")
+            await bot.send_photo(chat_id=user.telegram_id, photo=qr_file, caption=caption)
+        except Exception as e:
+            logger.error(f"Failed to generate/send test QR: {e}")
+            # fallback: ارسال فقط متن
+            await bot.send_message(chat_id=user.telegram_id, text=caption)
+
+        # ویرایش پیام جاری به تأیید کوچک
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.edit_text(
+                    "✅ کانفیگ تست با موفقیت ساخته شد و در پیوی شما ارسال شد.",
+                    reply_markup=back_kb
+                )
+            except TelegramBadRequest:
+                pass
+        return
+
+    # ❌ شکست
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.edit_text(
+                "❌ ساخت کانفیگ تست ناموفق بود. لطفاً بعداً مجدداً تلاش کنید.",
+                reply_markup=back_kb
+            )
+        except TelegramBadRequest:
+            pass
