@@ -12,19 +12,22 @@ from alembic import context
 
 from core.database.models import Base
 
-
 # اضافه کردن مسیر پروژه برای شناسایی ماژول‌ها
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 load_dotenv()
 
-# ایمپورت کردن Base از مدل‌ها
 # کانفیگ اصلی Alembic
 config = context.config
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    raise ValueError("متغیر DATABASE_URL در فایل .env یافت نشد!")
+    raise ValueError("متغیر DATABASE_URL یافت نشد!")
+
+# 🌟 [جادوی Railway]: اصلاح پیش‌وند دیتابیس برای پشتیبانی از asyncpg در مایگریشن‌ها
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
 config.set_main_option("sqlalchemy.url", DATABASE_URL)
 
 if config.config_file_name is not None:
