@@ -1,12 +1,16 @@
 import os
+import io
 import time
 import logging
 from typing import Sequence
+
+import qrcode
 from aiogram import Router, types, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, update
+from sqlalchemy import select, or_, update, func
 from sqlalchemy.orm import selectinload
 from aiogram.fsm.context import FSMContext
 
@@ -24,15 +28,40 @@ router = Router()
 async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
     stmt = select(Vendor).where(Vendor.telegram_id == user_id)
     vendor = (await db_session.execute(stmt)).scalar_one_or_none()
-    if not vendor: return None, None
+    if not vendor:
+        return None, None
 
     owner_id_str = os.getenv("OWNER_ID")
     is_owner = bool(owner_id_str and user_id == int(owner_id_str))
 
+    # 🌟 [جدید] شمارش فیشها و تیکتهای در انتظار برای نمایش Badge
+    # نکته: فقط تراکنشهایی که واقعاً عکس فیش آپلود شده دارند شمرده میشوند
+    pending_tx_count = await db_session.scalar(
+        select(func.count(Transaction.id)).where(
+            Transaction.vendor_id == vendor.id,
+            Transaction.status == "pending",
+            Transaction.receipt_file_id.is_not(None),
+        )
+    )
+    pending_ticket_count = await db_session.scalar(
+        select(func.count(Ticket.id)).where(
+            Ticket.vendor_id == vendor.id,
+            Ticket.status == "pending",
+        )
+    )
+
+    # تبدیل به int (در صورت None بودن نتیجه scalar)
+    pending_tx_count = int(pending_tx_count or 0)
+    pending_ticket_count = int(pending_ticket_count or 0)
+
+    # 🌟 ساخت متن دکمهها با Badge
+    receipts_label = f"💳 بررسی فیشها ({pending_tx_count})"
+    tickets_label = f"📨 پیامهای پشتیبانی ({pending_ticket_count})"
+
     kb = [
         [
             InlineKeyboardButton(text="👥 مشتریان من", callback_data="admin_my_users"),
-            InlineKeyboardButton(text="💳 بررسی فیشها", callback_data="admin_receipts")
+            InlineKeyboardButton(text=receipts_label, callback_data="admin_receipts")
         ],
         [
             InlineKeyboardButton(text="🔄 تنظیمات ریدایرکت", callback_data="admin_redirect"),
@@ -44,7 +73,7 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
         ],
         [
             InlineKeyboardButton(text="🛍 مدیریت پلنها", callback_data="admin_manage_plans"),
-            InlineKeyboardButton(text="📨 پیامهای پشتیبانی", callback_data="admin_support_tickets")
+            InlineKeyboardButton(text=tickets_label, callback_data="admin_support_tickets")
         ],
     ]
 
@@ -88,7 +117,173 @@ async def callback_back_to_admin_panel(callback: types.CallbackQuery, state: FSM
 
 @router.callback_query(F.data == "close_admin_panel")
 async def close_panel(callback: types.CallbackQuery):
-    if isinstance(callback.message, types.Message): await callback.message.delete()
+    if isinstance(callback.message, types.Message):
+        await callback.message.delete()
+    await callback.answer()
+
+
+# ==========================================
+# 🌟 [جدید] لیست فیشهای در انتظار (Pending Receipts)
+# ==========================================
+@router.callback_query(F.data == "admin_receipts")
+async def admin_receipts_list(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
+    ).scalar_one_or_none()
+    if not vendor:
+        await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
+        return
+
+    # واکشی تمام تراکنشهای pending این فروشنده بههمراه کاربر و پلن
+    # نکته: فقط تراکنشهایی که عکس فیش دارند (سبدهای رهاشده مستثنی میشوند)
+    stmt = (
+        select(Transaction)
+        .options(
+            selectinload(Transaction.user),
+            selectinload(Transaction.plan),
+        )
+        .where(
+            Transaction.vendor_id == vendor.id,
+            Transaction.status == "pending",
+            Transaction.receipt_file_id.is_not(None),
+        )
+        .order_by(Transaction.created_at.desc())
+    )
+    transactions = (await db_session.execute(stmt)).scalars().all()
+
+    if not transactions:
+        empty_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")]
+        ])
+        list_text = "💳 <b>فیشهای در انتظار</b>\n\nهیچ فیش جدیدی وجود ندارد."
+        if isinstance(callback.message, types.Message):
+            if callback.message.photo:
+                # بازگشت از صفحه فیش (عکس): کیبورد عکس پاک شود و لیست متن جدید ارسال گردد
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except TelegramBadRequest:
+                    pass
+                await callback.message.answer(text=list_text, reply_markup=empty_kb)
+            else:
+                try:
+                    await callback.message.edit_text(list_text, reply_markup=empty_kb)
+                except TelegramBadRequest:
+                    pass
+        await callback.answer()
+        return
+
+    kb: list[list[InlineKeyboardButton]] = []
+    for tx in transactions:
+        user_display = tx.user.telegram_id if tx.user else "نامشخص"
+        kb.append([
+            InlineKeyboardButton(
+                text=f"🧾 فیش کاربر {user_display} - {int(tx.amount):,} ت",
+                callback_data=f"adm_rcp_{tx.id}",
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")])
+
+    list_text = "💳 <b>فیشهای در انتظار</b>\n\nلطفاً یک فیش را برای بررسی انتخاب کنید:"
+    list_kb = InlineKeyboardMarkup(inline_keyboard=kb)
+
+    if isinstance(callback.message, types.Message):
+        if callback.message.photo:
+            # 🌟 بازگشت از صفحه فیش: عکس در چت باقی بماند، فقط کیبوردش پاک شود و لیست متن جدید ارسال گردد
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+            await callback.message.answer(text=list_text, reply_markup=list_kb)
+        else:
+            # پیمایش عادی از منوهای متنی
+            try:
+                await callback.message.edit_text(text=list_text, reply_markup=list_kb)
+            except TelegramBadRequest:
+                pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_rcp_"))
+async def admin_receipt_detail(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    tx_id_str = callback.data.replace("adm_rcp_", "")
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    tx_id = int(tx_id_str)
+
+    stmt = (
+        select(Transaction)
+        .options(
+            selectinload(Transaction.user),
+            selectinload(Transaction.plan),
+        )
+        .where(Transaction.id == tx_id)
+    )
+    tx = (await db_session.execute(stmt)).scalar_one_or_none()
+    if not tx or tx.status != "pending":
+        await callback.answer("❌ این فیش قبلاً بررسی شده یا وجود ندارد.", show_alert=True)
+        return
+
+    bot = callback.bot
+    if not bot:
+        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
+        return
+
+    user = tx.user
+    if not user:
+        await callback.answer("❌ کاربر مرتبط یافت نشد.", show_alert=True)
+        return
+
+    # ساخت متن اطلاعات فیش
+    plan_text = "شارژ عادی کیف پول"
+    if tx.plan:
+        plan_text = f"{tx.plan.title}"
+
+    caption = (
+        f"🧾 <b>بررسی فیش</b>\n\n"
+        f"👤 <b>کاربر:</b> <code>{user.telegram_id}</code>\n"
+        f"💰 <b>مبلغ:</b> <code>{int(tx.amount):,}</code> تومان\n"
+        f"📌 <b>بابت:</b> {plan_text}\n"
+        f"🕒 <b>زمان:</b> {tx.created_at.strftime('%Y-%m-%d %H:%M')}\n"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ تایید فیش", callback_data=f"admin_approve_tx_{tx.id}"),
+            InlineKeyboardButton(text="❌ رد فیش", callback_data=f"admin_reject_tx_{tx.id}"),
+        ],
+        [InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="admin_receipts")],
+    ])
+
+    # حذف کیبورد پیام فعلی
+    if isinstance(callback.message, types.Message):
+        await callback.message.edit_reply_markup(reply_markup=None)
+
+    # ارسال عکس فیش به همراه دکمههای تایید/رد
+    if tx.receipt_file_id:
+        try:
+            await bot.send_photo(
+                chat_id=callback.from_user.id,
+                photo=tx.receipt_file_id,
+                caption=caption,
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send receipt photo for tx {tx_id}: {e}")
+            # fallback: ارسال فقط متن
+            await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=kb)
+    else:
+        # اگر عکس نداشت، فقط متن بفرست
+        await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=kb)
+
     await callback.answer()
 
 # ==========================================
@@ -937,8 +1132,11 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
         await db_session.commit()
 
         if isinstance(callback.message, types.Message):
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.reply("✅ فیش تایید شد.")
+            # 🌟 حذف پیام عکس فیش از چت ادمین برای جلوگیری از شلوغی
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest:
+                pass
 
         await bot.send_message(
             chat_id=user.telegram_id,
@@ -948,6 +1146,10 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
                 f"موجودی فعلی: <code>{int(user.wallet_balance):,}</code> تومان"
             ),
         )
+
+        # 🌟 پاک کردن مرجع عکس فیش (حفظ سابقه مالی، حذف فقط برای صرفهجویی در فضا)
+        tx.receipt_file_id = None
+        await db_session.commit()
     else:
         # 🌟 خرید پلن: کسر مبلغ از کیف پول + ساخت کاربر واقعی در پنل
         plan = tx.plan
@@ -992,8 +1194,11 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
             await client.close()
 
         if isinstance(callback.message, types.Message):
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.reply("✅ فیش تایید شد و سرویس کاربر صادر گردید.")
+            # 🌟 حذف پیام عکس فیش از چت ادمین برای جلوگیری از شلوغی
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest:
+                pass
 
         msg_to_user = (
             f"✅ <b>پرداخت شما تایید شد!</b>\n\n"
@@ -1002,9 +1207,38 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
             f"💡 آموزش اتصال: ابتدا لینک بالا را کپی کرده و در نرمافزار خود وارد کنید."
         )
 
-        # 🌟 استفاده امن از bot
+        # 🌟 [جدید] تولید QR Code از لینک اشتراک و ارسال به عنوان عکس
         if isinstance(callback.message, types.Message):
-            await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
+            try:
+                import qrcode.constants as _qr_constants  # type: ignore[attr-defined]
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=_qr_constants.ERROR_CORRECT_M,
+                    box_size=10,
+                    border=4,
+                )
+                qr.add_data(sub_url)
+                qr.make(fit=True)
+                qr_image = qr.make_image(fill_color="black", back_color="white")
+                stream = io.BytesIO()
+                # استفاده از pil.save با فرمت PNG
+                qr_image.save(stream, "PNG")  # type: ignore[call-arg]
+                stream.seek(0)
+                qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
+
+                await bot.send_photo(
+                    chat_id=user.telegram_id,
+                    photo=qr_file,
+                    caption=msg_to_user,
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate/send QR code for tx {tx_id}: {e}")
+                # fallback: ارسال فقط متن در صورت شکست QR
+                await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
+
+        # 🌟 پاک کردن مرجع عکس فیش (حفظ سابقه مالی، حذف فقط برای صرفهجویی در فضا)
+        tx.receipt_file_id = None
+        await db_session.commit()
 
     await callback.answer()
 
@@ -1048,8 +1282,11 @@ async def admin_reject_transaction(callback: types.CallbackQuery, db_session: As
     await db_session.commit()
 
     if isinstance(callback.message, types.Message):
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.reply("❌ فیش رد شد و به کاربر اطلاع داده شد.")
+        # 🌟 حذف پیام عکس فیش از چت ادمین برای جلوگیری از شلوغی
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
 
     # 🌟 استفاده امن از bot
     if isinstance(callback.message, types.Message):

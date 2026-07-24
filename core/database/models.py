@@ -109,7 +109,7 @@ class Transaction(Base):
     server_id: Mapped[int] = mapped_column(ForeignKey('servers.id', ondelete='SET NULL'), nullable=True)
     plan_id: Mapped[int] = mapped_column(ForeignKey('plans.id', ondelete='SET NULL'), nullable=True)
     amount: Mapped[float] = mapped_column(Float)
-    receipt_file_id: Mapped[str] = mapped_column(String(255), nullable=True)
+    receipt_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     destination_card: Mapped[str] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -1,9 +1,11 @@
 import random
 import logging
 import time
+from datetime import datetime
 from typing import Any, Dict
 
 from aiogram import F, Router, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -704,7 +706,7 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
         # استخراج مقادیر از پاسخ API (با گارد روی مقادیر ممکن None/غیرموجود)
         data_limit = api_data.get("data_limit") or 0  # بایت
         used_traffic = api_data.get("used_traffic") or 0  # بایت
-        expire_ts = api_data.get("expire") or 0
+        expire_val = api_data.get("expire")  # ممکن است ISO string یا timestamp باشد
         status = api_data.get("status") or "unknown"
 
         # محاسبه حجمها به GB
@@ -712,11 +714,24 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
         used_gb = used_traffic / (1024 ** 3) if used_traffic else 0.0
         remaining_gb = max(total_gb - used_gb, 0.0) if data_limit else 0.0
 
-        # محاسبه روزهای باقیمانده
+        # 🌟 محاسبه روزهای باقیمانده با پارس امن ISO 8601 یا timestamp
+        # Marzban ممکن است expire را به صورت ISO string (مثلاً '2026-08-23T00:02:47Z') بفرستد
         remaining_days = 0
-        if expire_ts:
-            remaining_seconds = int(expire_ts) - int(time.time())
-            remaining_days = max(remaining_seconds // 86400, 0)
+        has_expire = False
+        if expire_val:
+            try:
+                if isinstance(expire_val, str) and "T" in expire_val:
+                    # فرمت ISO 8601 (مثال: 2026-08-23T00:02:47Z)
+                    dt = datetime.fromisoformat(expire_val.replace("Z", "+00:00"))
+                    expire_ts = int(dt.timestamp())
+                else:
+                    expire_ts = int(expire_val)
+                remaining_seconds = expire_ts - int(time.time())
+                remaining_days = max(remaining_seconds // 86400, 0)
+                has_expire = True
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Failed to parse expire value '{expire_val}': {e}")
+                has_expire = False
 
         # قالببندی خروجی
         if data_limit > 0:
@@ -726,7 +741,7 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
             total_text = "نامحدود ∞"
             remaining_text = "نامحدود ∞"
 
-        if expire_ts:
+        if has_expire:
             days_text = f"{remaining_days} روز"
         else:
             days_text = "نامحدود ∞"
@@ -746,5 +761,9 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
         )
 
     if isinstance(callback.message, types.Message):
-        await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
+        try:
+            await callback.message.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            # 🌟 اگر محتوا تغییر نکرده باشد (مثلاً حجم همان است) تلگرام خطا میدهد؛ نادیده بگیر
+            pass
+    await callback.answer("🔄 اطلاعات بروزرسانی شد")
