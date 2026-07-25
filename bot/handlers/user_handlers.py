@@ -1,6 +1,6 @@
 import io
-import random
 import logging
+import random
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -11,29 +11,43 @@ from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select, func, or_
-from sqlalchemy.orm import selectinload
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from bot.config import BUTTONS, MESSAGES
-from bot.states import WalletChargeStates, UserStates, PurchaseStates
+from bot.states import PurchaseStates, UserStates, WalletChargeStates
 from core.database.crud import get_or_create_user
-from core.database.models import Transaction, User, Vendor, Plan, Server, Ticket, ForceJoinChannel, VendorServer, DiscountCode
+from core.database.models import (
+    DiscountCode,
+    ForceJoinChannel,
+    Plan,
+    Server,
+    Ticket,
+    Transaction,
+    User,
+    Vendor,
+    VendorServer,
+)
 from core.services.panel_client import MarzbanClient
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
+
 # --- ۱. هندلر استارت ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
-    if not message.from_user: return
+    if not message.from_user:
+        return
 
     user_id: int = message.from_user.id
-    first_name: str = message.from_user.first_name if message.from_user else MESSAGES["default_user"]
+    first_name: str = (
+        message.from_user.first_name if message.from_user else MESSAGES["default_user"]
+    )
 
     deep_link_vendor_id: Optional[int] = None
     if message.text:
@@ -43,7 +57,7 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
             numeric_part = raw_payload
             for prefix in ("ref_", "start_", "vendor_"):
                 if numeric_part.startswith(prefix):
-                    numeric_part = numeric_part[len(prefix):]
+                    numeric_part = numeric_part[len(prefix) :]
                     break
             if numeric_part.isdigit():
                 deep_link_vendor_id = int(numeric_part)
@@ -62,16 +76,30 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
 
     main_menu_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=BUTTONS["buy_new_service"], callback_data="buy_new_service")],
             [
-                InlineKeyboardButton(text=BUTTONS["my_services"], callback_data="my_services"),
-                InlineKeyboardButton(text=BUTTONS["charge_wallet"], callback_data="charge_wallet"),
+                InlineKeyboardButton(
+                    text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
+                )
             ],
             [
-                InlineKeyboardButton(text=BUTTONS["user_profile"], callback_data="user_profile"),
+                InlineKeyboardButton(
+                    text=BUTTONS["my_services"], callback_data="my_services"
+                ),
+                InlineKeyboardButton(
+                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["user_profile"], callback_data="user_profile"
+                ),
                 InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
             ],
-            [InlineKeyboardButton(text=BUTTONS["free_test"], callback_data="free_test_start")],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["free_test"], callback_data="free_test_start"
+                )
+            ],
         ]
     )
     await message.answer(text=welcome_text, reply_markup=main_menu_keyboard)
@@ -79,10 +107,17 @@ async def cmd_start(message: types.Message, db_session: AsyncSession) -> None:
 
 # --- ۲. بازگشت به منوی اصلی ---
 @router.callback_query(F.data == "back_to_main")
-async def process_back_to_main(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
-    if not callback.from_user: return
+async def process_back_to_main(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.from_user:
+        return
 
-    first_name = callback.from_user.first_name if callback.from_user else MESSAGES["default_user"]
+    first_name = (
+        callback.from_user.first_name
+        if callback.from_user
+        else MESSAGES["default_user"]
+    )
 
     stmt = select(User).where(User.telegram_id == callback.from_user.id)
     user = (await db_session.execute(stmt)).scalar_one_or_none()
@@ -92,28 +127,47 @@ async def process_back_to_main(callback: types.CallbackQuery, db_session: AsyncS
 
     main_menu_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=BUTTONS["buy_new_service"], callback_data="buy_new_service")],
             [
-                InlineKeyboardButton(text=BUTTONS["my_services"], callback_data="my_services"),
-                InlineKeyboardButton(text=BUTTONS["charge_wallet"], callback_data="charge_wallet"),
+                InlineKeyboardButton(
+                    text=BUTTONS["buy_new_service"], callback_data="buy_new_service"
+                )
             ],
             [
-                InlineKeyboardButton(text=BUTTONS["user_profile"], callback_data="user_profile"),
+                InlineKeyboardButton(
+                    text=BUTTONS["my_services"], callback_data="my_services"
+                ),
+                InlineKeyboardButton(
+                    text=BUTTONS["charge_wallet"], callback_data="charge_wallet"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["user_profile"], callback_data="user_profile"
+                ),
                 InlineKeyboardButton(text=BUTTONS["support"], callback_data="support"),
             ],
-            [InlineKeyboardButton(text=BUTTONS["free_test"], callback_data="free_test_start")],
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["free_test"], callback_data="free_test_start"
+                )
+            ],
         ]
     )
 
     if isinstance(callback.message, types.Message):
-        await callback.message.edit_text(text=welcome_text, reply_markup=main_menu_keyboard)
+        await callback.message.edit_text(
+            text=welcome_text, reply_markup=main_menu_keyboard
+        )
     await callback.answer()
 
 
 # --- ۳. نمایش سرورها (به عنوان دسته‌بندی پلن‌ها) ---
 @router.callback_query(F.data == "buy_new_service")
-async def process_buy_new_service(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
-    if not callback.from_user: return
+async def process_buy_new_service(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.from_user:
+        return
 
     stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
     user = (await db_session.execute(stmt_user)).scalar_one_or_none()
@@ -122,7 +176,9 @@ async def process_buy_new_service(callback: types.CallbackQuery, db_session: Asy
         await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
         return
 
-    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == user.vendor_id)
+    shared_subq = select(VendorServer.server_id).where(
+        VendorServer.vendor_id == user.vendor_id
+    )
     stmt_servers = (
         select(Server)
         .join(Plan, Plan.server_id == Server.id)
@@ -144,7 +200,15 @@ async def process_buy_new_service(callback: types.CallbackQuery, db_session: Asy
         if isinstance(callback.message, types.Message):
             await callback.message.edit_text(
                 "❌ فروشگاه شما هنوز هیچ سرویسی تعریف نکرده است.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]])
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="🔙 بازگشت", callback_data="back_to_main"
+                            )
+                        ]
+                    ]
+                ),
             )
         await callback.answer()
         return
@@ -165,17 +229,24 @@ async def process_buy_new_service(callback: types.CallbackQuery, db_session: Asy
 
 # --- ۴. نمایش پلن‌های یک سرور خاص ---
 @router.callback_query(F.data.startswith("sel_srv_"))
-async def process_server_selection(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
-    if not callback.data or not callback.from_user: return
+async def process_server_selection(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
     srv_id_str = callback.data.replace("sel_srv_", "")
-    if not srv_id_str.isdigit(): return
+    if not srv_id_str.isdigit():
+        return
     srv_id = int(srv_id_str)
 
     stmt_user = select(User).where(User.telegram_id == callback.from_user.id)
     user = (await db_session.execute(stmt_user)).scalar_one_or_none()
-    if not user: return
+    if not user:
+        return
 
-    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == user.vendor_id)
+    shared_subq = select(VendorServer.server_id).where(
+        VendorServer.vendor_id == user.vendor_id
+    )
     stmt_plans = (
         select(Plan)
         .options(selectinload(Plan.server))
@@ -207,30 +278,41 @@ async def process_server_selection(callback: types.CallbackQuery, db_session: As
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
             text=f"📁 <b>سرویس‌های {server_name}</b>\n\nپلن مورد نظر خود را انتخاب کنید:",
-            reply_markup=builder.as_markup()
+            reply_markup=builder.as_markup(),
         )
     await callback.answer()
 
 
 # --- ۵. انتخاب پلن و نمایش جزئیات ---
 @router.callback_query(F.data.startswith("buy_plan_"))
-async def process_plan_selection(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
-    if not callback.data or not callback.from_user: return
+async def process_plan_selection(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
 
     plan_id_str = callback.data.replace("buy_plan_", "")
-    if not plan_id_str.isdigit(): return
+    if not plan_id_str.isdigit():
+        return
     plan_id = int(plan_id_str)
 
-    stmt_plan = select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id)
+    stmt_plan = (
+        select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id)
+    )
     plan = (await db_session.execute(stmt_plan)).scalar_one_or_none()
 
     if not plan:
         await callback.answer("❌ پلن مورد نظر یافت نشد.", show_alert=True)
         return
 
-    stmt_user = select(User, Vendor).join(Vendor, User.vendor_id == Vendor.id).where(User.telegram_id == callback.from_user.id)
+    stmt_user = (
+        select(User, Vendor)
+        .join(Vendor, User.vendor_id == Vendor.id)
+        .where(User.telegram_id == callback.from_user.id)
+    )
     row = (await db_session.execute(stmt_user)).first()
-    if not row: return
+    if not row:
+        return
     user, vendor = row
 
     wallet_balance = int(user.wallet_balance)
@@ -246,7 +328,9 @@ async def process_plan_selection(callback: types.CallbackQuery, db_session: Asyn
 
     vol_text = "نامحدود ∞" if plan.volume_gb == 0 else f"{plan.volume_gb} گیگابایت"
     days_text = "نامحدود ∞" if plan.days == 0 else f"{plan.days} روز"
-    user_limit_text = "نامحدود ∞" if plan.user_limit == 0 else f"{plan.user_limit} کاربر"
+    user_limit_text = (
+        "نامحدود ∞" if plan.user_limit == 0 else f"{plan.user_limit} کاربر"
+    )
     desc_text = plan.description if plan.description else "ندارد"
 
     plan_details = (
@@ -264,16 +348,29 @@ async def process_plan_selection(callback: types.CallbackQuery, db_session: Asyn
     builder = InlineKeyboardBuilder()
 
     if is_card_missing and wallet_balance < plan.price:
-        text = "❌ <b>شماره کارت فروشگاه ثبت نشده است!</b>\n\n" + plan_details + "لطفاً پیش از اقدام به خرید، با پشتیبانی هماهنگ کنید."
+        text = (
+            "❌ <b>شماره کارت فروشگاه ثبت نشده است!</b>\n\n"
+            + plan_details
+            + "لطفاً پیش از اقدام به خرید، با پشتیبانی هماهنگ کنید."
+        )
     else:
-        builder.button(text="🎁 اعمال کد تخفیف / شارژ", callback_data=f"charge_req_{plan.id}")
+        builder.button(
+            text="🎁 اعمال کد تخفیف / شارژ", callback_data=f"charge_req_{plan.id}"
+        )
 
         if wallet_balance >= plan.price:
-            builder.button(text="✅ خرید مستقیم از کیف پول", callback_data=f"wallet_buy_{plan.id}_0")
+            builder.button(
+                text="✅ خرید مستقیم از کیف پول",
+                callback_data=f"wallet_buy_{plan.id}_0",
+            )
 
-        text = "🛍 <b>مشخصات سرویس</b>\n\n" + plan_details + "لطفاً یک گزینه را انتخاب کنید:"
+        text = (
+            "🛍 <b>مشخصات سرویس</b>\n\n" + plan_details + "لطفاً یک گزینه را انتخاب کنید:"
+        )
 
-    builder.button(text="🔙 بازگشت به سرویس‌ها", callback_data=f"sel_srv_{plan.server_id}")
+    builder.button(
+        text="🔙 بازگشت به سرویس‌ها", callback_data=f"sel_srv_{plan.server_id}"
+    )
     builder.adjust(1)
 
     if isinstance(callback.message, types.Message):
@@ -284,11 +381,15 @@ async def process_plan_selection(callback: types.CallbackQuery, db_session: Asyn
 
 # --- ۶. مرحله تخفیف + صدور پیش‌فاکتور ---
 @router.callback_query(F.data.startswith("charge_req_"))
-async def apply_discount_start(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession) -> None:
-    if not callback.data or not callback.from_user: return
+async def apply_discount_start(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
 
     plan_id_str = callback.data.replace("charge_req_", "")
-    if not plan_id_str.isdigit(): return
+    if not plan_id_str.isdigit():
+        return
     plan_id = int(plan_id_str)
 
     stmt_plan = select(Plan).where(Plan.id == plan_id)
@@ -297,9 +398,14 @@ async def apply_discount_start(callback: types.CallbackQuery, state: FSMContext,
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
         return
 
-    stmt = select(User, Vendor).join(Vendor, User.vendor_id == Vendor.id).where(User.telegram_id == callback.from_user.id)
+    stmt = (
+        select(User, Vendor)
+        .join(Vendor, User.vendor_id == Vendor.id)
+        .where(User.telegram_id == callback.from_user.id)
+    )
     row = (await db_session.execute(stmt)).first()
-    if not row: return
+    if not row:
+        return
     user_row, vendor_row = row
 
     await state.update_data(
@@ -315,10 +421,16 @@ async def apply_discount_start(callback: types.CallbackQuery, state: FSMContext,
         "اگر کد تخفیف دارید، آن را ارسال کنید.\n"
         "در غیر این صورت روی دکمه زیر کلیک کنید."
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ ادامه بدون تخفیف", callback_data="skip_discount")],
-        [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")],
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⏭ ادامه بدون تخفیف", callback_data="skip_discount"
+                )
+            ],
+            [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")],
+        ]
+    )
 
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(text, reply_markup=kb)
@@ -327,8 +439,12 @@ async def apply_discount_start(callback: types.CallbackQuery, state: FSMContext,
     await callback.answer()
 
 
-@router.callback_query(F.data == "skip_discount", PurchaseStates.waiting_for_discount_code)
-async def skip_discount(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession) -> None:
+@router.callback_query(
+    F.data == "skip_discount", PurchaseStates.waiting_for_discount_code
+)
+async def skip_discount(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+) -> None:
     if not callback.from_user:
         await callback.answer()
         return
@@ -337,12 +453,16 @@ async def skip_discount(callback: types.CallbackQuery, state: FSMContext, db_ses
     original_price = int(original_price_raw) if original_price_raw is not None else 0
 
     if isinstance(callback.message, types.Message):
-        await _create_purchase_invoice(callback.message, state, db_session, 0, original_price)
+        await _create_purchase_invoice(
+            callback.message, state, db_session, 0, original_price
+        )
     await callback.answer()
 
 
 @router.message(PurchaseStates.waiting_for_discount_code)
-async def process_discount_code(message: types.Message, state: FSMContext, db_session: AsyncSession) -> None:
+async def process_discount_code(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+) -> None:
     if not message.text or not message.from_user:
         return
 
@@ -375,13 +495,15 @@ async def process_discount_code(message: types.Message, state: FSMContext, db_se
     if server_owner_id is not None and server_owner_id not in allowed_vendor_ids:
         allowed_vendor_ids.append(int(server_owner_id))
 
-    dc = (await db_session.execute(
-        select(DiscountCode).where(
-            DiscountCode.vendor_id.in_(allowed_vendor_ids),
-            DiscountCode.code == code,
-            DiscountCode.is_active == True,
+    dc = (
+        await db_session.execute(
+            select(DiscountCode).where(
+                DiscountCode.vendor_id.in_(allowed_vendor_ids),
+                DiscountCode.code == code,
+                DiscountCode.is_active == True,
+            )
         )
-    )).scalar_one_or_none()
+    ).scalar_one_or_none()
 
     if not dc:
         await message.answer(
@@ -406,7 +528,9 @@ async def process_discount_code(message: types.Message, state: FSMContext, db_se
     price_after_discount = original_price - discount_amount
 
     await state.update_data(discount_code_id=dc.id)
-    await _create_purchase_invoice(message, state, db_session, discount_percent, price_after_discount)
+    await _create_purchase_invoice(
+        message, state, db_session, discount_percent, price_after_discount
+    )
 
 
 async def _create_purchase_invoice(
@@ -433,11 +557,19 @@ async def _create_purchase_invoice(
     user_id_db = int(user_id_raw)
     vendor_id = int(vendor_id_raw)
     original_price = int(original_price_raw) if original_price_raw is not None else 0
-    discount_code_id: Optional[int] = int(discount_code_id_raw) if discount_code_id_raw is not None else None
+    discount_code_id: Optional[int] = (
+        int(discount_code_id_raw) if discount_code_id_raw is not None else None
+    )
 
-    user = (await db_session.execute(select(User).where(User.id == user_id_db))).scalar_one_or_none()
-    plan = (await db_session.execute(select(Plan).where(Plan.id == plan_id))).scalar_one_or_none()
-    vendor = (await db_session.execute(select(Vendor).where(Vendor.id == vendor_id))).scalar_one_or_none()
+    user = (
+        await db_session.execute(select(User).where(User.id == user_id_db))
+    ).scalar_one_or_none()
+    plan = (
+        await db_session.execute(select(Plan).where(Plan.id == plan_id))
+    ).scalar_one_or_none()
+    vendor = (
+        await db_session.execute(select(Vendor).where(Vendor.id == vendor_id))
+    ).scalar_one_or_none()
 
     if not user or not plan or not vendor:
         await message.answer("❌ خطایی رخ داد.")
@@ -450,7 +582,9 @@ async def _create_purchase_invoice(
     discount_line = ""
     if discount_percent > 0:
         discount_amount = original_price - price_after_discount
-        discount_line = f"🎯 تخفیف ({discount_percent}%): <code>-{discount_amount:,}</code> تومان\n"
+        discount_line = (
+            f"🎯 تخفیف ({discount_percent}%): <code>-{discount_amount:,}</code> تومان\n"
+        )
 
     # 🟢 حالت اول: کیف پول به تنهایی تمام هزینه را پوشش می‌دهد
     if wallet_balance >= price_after_discount:
@@ -463,10 +597,17 @@ async def _create_purchase_invoice(
             "✅ <b>موجودی شما برای این خرید کافی است.</b>\n"
             "برای کسر از کیف پول و دریافت آنی کانفیگ، روی دکمه زیر کلیک کنید:"
         )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ پرداخت اتوماتیک و دریافت کانفیگ", callback_data=f"wallet_buy_{plan.id}_{dc_id_str}")],
-            [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]
-        ])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ پرداخت اتوماتیک و دریافت کانفیگ",
+                        callback_data=f"wallet_buy_{plan.id}_{dc_id_str}",
+                    )
+                ],
+                [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")],
+            ]
+        )
         await message.answer(text, reply_markup=kb)
         return
 
@@ -477,7 +618,11 @@ async def _create_purchase_invoice(
     target_vendor = vendor
     target_vendor_id = vendor.id
     if vendor.redirect_target_id:
-        redirected = (await db_session.execute(select(Vendor).where(Vendor.id == vendor.redirect_target_id))).scalar_one_or_none()
+        redirected = (
+            await db_session.execute(
+                select(Vendor).where(Vendor.id == vendor.redirect_target_id)
+            )
+        ).scalar_one_or_none()
         if redirected:
             target_vendor = redirected
             target_vendor_id = redirected.id
@@ -486,10 +631,6 @@ async def _create_purchase_invoice(
         await message.answer("❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است.")
         await state.clear()
         return
-
-    random_fee = random.randint(1, 900)
-    amount_with_fee = payable_via_card + random_fee
-    amount_with_fee_rial = amount_with_fee * 10
 
     new_tx = Transaction(
         user_id=user_id_db,
@@ -504,13 +645,16 @@ async def _create_purchase_invoice(
         status="pending",
     )
     db_session.add(new_tx)
+    await db_session.flush()
+
+    random_fee = (new_tx.id * 73) % 899 + 1
+    amount_with_fee = payable_via_card + random_fee
+    amount_with_fee_rial = amount_with_fee * 10
+
     await db_session.commit()
     await db_session.refresh(new_tx)
 
-    await state.update_data(
-        transaction_id=new_tx.id,
-        wallet_used=wallet_used
-    )
+    await state.update_data(transaction_id=new_tx.id, wallet_used=wallet_used)
 
     wallet_line = ""
     if wallet_used > 0:
@@ -529,23 +673,39 @@ async def _create_purchase_invoice(
         "📸 پس از واریز، عکس رسید را همینجا بفرستید تا کانفیگ صادر شود:"
     )
 
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]])
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]
+        ]
+    )
     await message.answer(text, reply_markup=cancel_kb)
     await state.set_state(WalletChargeStates.waiting_for_receipt)
 
 
 # --- ۶.۵. هندلر پرداخت مستقیم و اتوماتیک از کیف پول ---
 @router.callback_query(F.data.startswith("wallet_buy_"))
-async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
-    if not callback.data or not callback.from_user: return
+async def process_wallet_buy(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
+    if not callback.data or not callback.from_user:
+        return
 
     parts = callback.data.split("_")
-    if len(parts) != 4: return
+    if len(parts) != 4:
+        return
     plan_id = int(parts[2])
     dc_id = int(parts[3])
 
-    user = (await db_session.execute(select(User).where(User.telegram_id == callback.from_user.id))).scalar_one_or_none()
-    plan = (await db_session.execute(select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id))).scalar_one_or_none()
+    user = (
+        await db_session.execute(
+            select(User).where(User.telegram_id == callback.from_user.id)
+        )
+    ).scalar_one_or_none()
+    plan = (
+        await db_session.execute(
+            select(Plan).options(selectinload(Plan.server)).where(Plan.id == plan_id)
+        )
+    ).scalar_one_or_none()
 
     if not user or not plan:
         await callback.answer("❌ خطایی رخ داد.", show_alert=True)
@@ -554,14 +714,21 @@ async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSes
     original_price = int(plan.price)
     discount_percent = 0
     if dc_id > 0:
-        dc = (await db_session.execute(select(DiscountCode).where(DiscountCode.id == dc_id))).scalar_one_or_none()
-        if dc: discount_percent = dc.discount_percent
+        dc = (
+            await db_session.execute(
+                select(DiscountCode).where(DiscountCode.id == dc_id)
+            )
+        ).scalar_one_or_none()
+        if dc:
+            discount_percent = dc.discount_percent
 
     discount_amount = original_price * discount_percent // 100
     final_price = original_price - discount_amount
 
     if user.wallet_balance < final_price:
-        await callback.answer("❌ موجودی کیف پول شما تغییر کرده و کافی نیست!", show_alert=True)
+        await callback.answer(
+            "❌ موجودی کیف پول شما تغییر کرده و کافی نیست!", show_alert=True
+        )
         return
 
     user.wallet_balance -= final_price
@@ -574,7 +741,7 @@ async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSes
         original_amount=original_price,
         discount_percent=discount_percent,
         discount_code_id=dc_id if dc_id > 0 else None,
-        status="approved"
+        status="approved",
     )
     db_session.add(new_tx)
     await db_session.commit()
@@ -588,7 +755,9 @@ async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSes
     data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
 
     # 🌟 رفع خطای Type-Hinting مرزبان با ارسال String صریح به جای None
-    expire_iso: str = str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
+    expire_iso: str = (
+        str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
+    )
 
     client = MarzbanClient(
         base_url=server.panel_url,
@@ -621,19 +790,27 @@ async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSes
             f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
         )
         try:
-            import qrcode.constants as _qr_constants # type: ignore[import-untyped]
-            qr = qrcode.QRCode(version=1, error_correction=_qr_constants.ERROR_CORRECT_M, box_size=10, border=4) # type: ignore[call-overload]
+            import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=_qr_constants.ERROR_CORRECT_M,
+                box_size=10,
+                border=4,
+            )  # type: ignore[call-overload]
             qr.add_data(sub_url)
             qr.make(fit=True)
             qr_image = qr.make_image(fill_color="black", back_color="white")
             stream = io.BytesIO()
-            qr_image.save(stream, "PNG") # type: ignore[call-arg]
+            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
             stream.seek(0)
             qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
             if isinstance(callback.message, types.Message):
                 await callback.message.delete()
             if callback.bot is not None:
-                await callback.bot.send_photo(chat_id=user.telegram_id, photo=qr_file, caption=caption)
+                await callback.bot.send_photo(
+                    chat_id=user.telegram_id, photo=qr_file, caption=caption
+                )
         except Exception:
             if isinstance(callback.message, types.Message):
                 await callback.message.edit_text(caption)
@@ -642,13 +819,18 @@ async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSes
         new_tx.status = "failed"
         await db_session.commit()
         if isinstance(callback.message, types.Message):
-            await callback.message.edit_text("❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد.")
+            await callback.message.edit_text(
+                "❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
+            )
 
 
 # --- ۷. دریافت عکس رسید و ارسال به پی‌وی ادمین ---
 @router.message(WalletChargeStates.waiting_for_receipt, F.photo)
-async def process_receipt_photo(message: types.Message, state: FSMContext, db_session: AsyncSession) -> None:
-    if not message.photo or not message.from_user or not message.bot: return
+async def process_receipt_photo(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+) -> None:
+    if not message.photo or not message.from_user or not message.bot:
+        return
 
     data = await state.get_data()
     tx_id_raw = data.get("transaction_id")
@@ -666,7 +848,11 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
 
     photo_file_id = message.photo[-1].file_id
 
-    stmt = select(Transaction).options(selectinload(Transaction.plan).selectinload(Plan.server)).where(Transaction.id == transaction_id)
+    stmt = (
+        select(Transaction)
+        .options(selectinload(Transaction.plan).selectinload(Plan.server))
+        .where(Transaction.id == transaction_id)
+    )
     transaction = (await db_session.execute(stmt)).scalar_one_or_none()
 
     if not transaction:
@@ -679,7 +865,9 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
         stmt_user = select(User).where(User.id == transaction.user_id)
         user = (await db_session.execute(stmt_user)).scalar_one_or_none()
         if not user or user.wallet_balance < wallet_used:
-            await message.answer("❌ موجودی کیف پول شما تغییر کرده است. این فاکتور نامعتبر شد.")
+            await message.answer(
+                "❌ موجودی کیف پول شما تغییر کرده است. این فاکتور نامعتبر شد."
+            )
             transaction.status = "canceled"
             await db_session.commit()
             await state.clear()
@@ -689,7 +877,8 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
 
     stmt_vendor = select(Vendor).where(Vendor.id == transaction.vendor_id)
     vendor = (await db_session.execute(stmt_vendor)).scalar_one_or_none()
-    if not vendor: return
+    if not vendor:
+        return
 
     transaction.receipt_file_id = photo_file_id
     transaction.status = "pending"
@@ -699,42 +888,61 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
     if vendor.redirect_target_id:
         stmt_redirect = select(Vendor).where(Vendor.id == vendor.redirect_target_id)
         target = (await db_session.execute(stmt_redirect)).scalar_one_or_none()
-        if target: admin_tg_id = target.telegram_id
+        if target:
+            admin_tg_id = target.telegram_id
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ تایید فیش", callback_data=f"admin_approve_tx_{transaction.id}"),
-            InlineKeyboardButton(text="❌ رد فیش", callback_data=f"admin_reject_tx_{transaction.id}")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ تایید فیش",
+                    callback_data=f"admin_approve_tx_{transaction.id}",
+                ),
+                InlineKeyboardButton(
+                    text="❌ رد فیش", callback_data=f"admin_reject_tx_{transaction.id}"
+                ),
+            ]
         ]
-    ])
+    )
 
     plan_text = "شارژ عادی کیف پول"
     if transaction.plan_id and transaction.plan:
-        vol_str = "نامحدود" if transaction.plan.volume_gb == 0 else f"{transaction.plan.volume_gb}GB"
-        server_name = transaction.plan.server.name if transaction.plan.server else "نامشخص"
+        vol_str = (
+            "نامحدود"
+            if transaction.plan.volume_gb == 0
+            else f"{transaction.plan.volume_gb}GB"
+        )
+        server_name = (
+            transaction.plan.server.name if transaction.plan.server else "نامشخص"
+        )
         plan_text = f"خرید {transaction.plan.title} | سرور: {server_name} ({vol_str} / {transaction.plan.days} روز)"
 
-    amount_rial = int(transaction.amount) * 10
+    random_fee = (transaction.id * 73) % 899 + 1
+    amount_with_fee = int(transaction.amount) + random_fee
+    amount_with_fee_rial = amount_with_fee * 10
+
     caption = (
         f"🧾 <b>فیش واریزی جدید</b>\n\n"
         f"👤 آیدی کاربر: <code>{message.from_user.id}</code>\n"
-        f"💰 مبلغ واریز (رسید): <code>{int(transaction.amount):,}</code> تومان - (<code>{amount_rial:,}</code> ریال)\n"
+        f"💰 مبلغ واریز (رسید): <code>{amount_with_fee:,}</code> تومان (<code>{amount_with_fee_rial:,}</code> ریال)\n"
     )
     if wallet_used > 0:
         caption += f"💎 کسر شده از کیف پول: <code>{wallet_used:,}</code> تومان\n"
 
     if transaction.discount_percent and transaction.discount_percent > 0:
-        caption += (
-            f"🎯 تخفیف ({transaction.discount_percent}%)\n"
-        )
+        caption += f"🎯 تخفیف ({transaction.discount_percent}%)\n"
     caption += f"📌 بابت: <b>{plan_text}</b>"
 
     try:
-        await message.bot.send_photo(chat_id=admin_tg_id, photo=photo_file_id, caption=caption, reply_markup=kb)
+        await message.bot.send_photo(
+            chat_id=admin_tg_id, photo=photo_file_id, caption=caption, reply_markup=kb
+        )
     except Exception as e:
         logger.error(f"Failed to send receipt to admin: {e}")
 
-    await message.answer("✅ <b>فیش شما با موفقیت ثبت شد!</b>\n\nبه محض تایید ادمین، نتیجه به شما اعلام خواهد شد.")
+    await message.answer(
+        "✅ <b>فیش شما با موفقیت ثبت شد!</b>\n\nبه محض تایید ادمین، نتیجه به شما اعلام خواهد شد."
+    )
     await state.clear()
     await cmd_start(message, db_session)
 
@@ -746,21 +954,32 @@ async def process_receipt_invalid(message: types.Message) -> None:
 
 # --- ۸. هندلرهای شارژ عادی کیف پول ---
 @router.callback_query(F.data == "charge_wallet")
-async def ask_charge_amount(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession) -> None:
-    if not callback.from_user: return
-    stmt = select(User, Vendor).join(Vendor, User.vendor_id == Vendor.id).where(User.telegram_id == callback.from_user.id)
+async def ask_charge_amount(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+) -> None:
+    if not callback.from_user:
+        return
+    stmt = (
+        select(User, Vendor)
+        .join(Vendor, User.vendor_id == Vendor.id)
+        .where(User.telegram_id == callback.from_user.id)
+    )
     row = (await db_session.execute(stmt)).first()
-    if not row: return
+    if not row:
+        return
 
     _, vendor_row = row
     target_vendor = vendor_row
     if vendor_row.redirect_target_id:
         stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_target_id)
         redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
-        if redirected_vendor: target_vendor = redirected_vendor
+        if redirected_vendor:
+            target_vendor = redirected_vendor
 
     if not target_vendor.card_number:
-        await callback.answer("❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است.", show_alert=True)
+        await callback.answer(
+            "❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است.", show_alert=True
+        )
         return
 
     text = (
@@ -768,7 +987,11 @@ async def ask_charge_amount(callback: types.CallbackQuery, state: FSMContext, db
         "لطفاً مبلغی که قصد دارید کیف پول خود را شارژ کنید، به تومان و به صورت عدد ارسال کنید.\n"
         "مثال: 50000"
     )
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ انصراف", callback_data="back_to_main")]])
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ انصراف", callback_data="back_to_main")]
+        ]
+    )
 
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(text, reply_markup=cancel_kb)
@@ -778,8 +1001,11 @@ async def ask_charge_amount(callback: types.CallbackQuery, state: FSMContext, db
 
 
 @router.message(WalletChargeStates.waiting_for_amount)
-async def process_charge_amount(message: types.Message, state: FSMContext, db_session: AsyncSession) -> None:
-    if not message.from_user or not message.text: return
+async def process_charge_amount(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+) -> None:
+    if not message.from_user or not message.text:
+        return
 
     if not message.text.isdigit():
         await message.answer("❌ لطفاً مبلغ را فقط به صورت عدد وارد کنید.")
@@ -790,25 +1016,30 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
         await message.answer("❌ حداقل مبلغ شارژ ۱۰,۰۰۰ تومان است.")
         return
 
-    stmt = select(User, Vendor).join(Vendor, User.vendor_id == Vendor.id).where(User.telegram_id == message.from_user.id)
+    stmt = (
+        select(User, Vendor)
+        .join(Vendor, User.vendor_id == Vendor.id)
+        .where(User.telegram_id == message.from_user.id)
+    )
     row = (await db_session.execute(stmt)).first()
-    if not row: return
+    if not row:
+        return
     user_row, vendor_row = row
 
     target_vendor = vendor_row
     if vendor_row.redirect_target_id:
         stmt_target = select(Vendor).where(Vendor.id == vendor_row.redirect_target_id)
         redirected_vendor = (await db_session.execute(stmt_target)).scalar_one_or_none()
-        if redirected_vendor: target_vendor = redirected_vendor
+        if redirected_vendor:
+            target_vendor = redirected_vendor
 
     if not target_vendor.card_number:
-        await message.answer("❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است. عملیات لغو شد.")
+        await message.answer(
+            "❌ فروشگاه هنوز شماره کارتی برای پرداخت ثبت نکرده است. عملیات لغو شد."
+        )
         await state.clear()
         await cmd_start(message, db_session)
         return
-
-    random_fee = random.randint(1, 900)
-    final_amount = base_amount + random_fee
 
     target_vendor_id = target_vendor.id
     origin_vendor_id: Optional[int] = None
@@ -819,16 +1050,22 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
         user_id=user_row.id,
         vendor_id=target_vendor_id,
         origin_vendor_id=origin_vendor_id,
-        amount=final_amount,
+        amount=base_amount,
         destination_card=target_vendor.card_number,
-        status="pending"
+        status="pending",
     )
     db_session.add(new_tx)
+    await db_session.flush()
+
+    # 🌟 محاسبه با الگوریتم قطعی
+    random_fee = (new_tx.id * 73) % 899 + 1
+    final_amount = base_amount + random_fee
+    final_amount_rial = final_amount * 10
+
     await db_session.commit()
     await db_session.refresh(new_tx)
 
     await state.update_data(transaction_id=new_tx.id, wallet_used=0)
-    final_amount_rial = final_amount * 10
     text = (
         f"🧾 <b>اطلاعات پرداخت</b>\n\n"
         f"💳 لطفاً مبلغ زیر را به شماره کارت <b>{target_vendor.name}</b> واریز کنید:\n"
@@ -838,7 +1075,11 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
         "📸 پس از واریز، عکس رسید خود را همینجا بفرستید:"
     )
 
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]])
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ لغو", callback_data="back_to_main")]
+        ]
+    )
     await message.answer(text, reply_markup=cancel_kb)
     await state.set_state(WalletChargeStates.waiting_for_receipt)
 
@@ -847,7 +1088,9 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
 # 🌟 پروفایل کاربر
 # ==========================================
 @router.callback_query(F.data == "user_profile")
-async def process_user_profile(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def process_user_profile(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.from_user:
         await callback.answer()
         return
@@ -879,9 +1122,11 @@ async def process_user_profile(callback: types.CallbackQuery, db_session: AsyncS
         f"🛍 <b>تعداد سرویسها:</b> {total_services}\n"
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]
+        ]
+    )
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
@@ -891,7 +1136,9 @@ async def process_user_profile(callback: types.CallbackQuery, db_session: AsyncS
 # 🌟 پشتیبانی / تیکتینگ
 # ==========================================
 @router.callback_query(F.data == "support")
-async def process_support(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession) -> None:
+async def process_support(
+    callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession
+) -> None:
     if not callback.from_user:
         await callback.answer()
         return
@@ -913,9 +1160,11 @@ async def process_support(callback: types.CallbackQuery, state: FSMContext, db_s
 
     await state.update_data(ticket_user_id=user.id, ticket_vendor_id=final_vendor_id)
 
-    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ انصراف", callback_data="back_to_main")]
-    ])
+    cancel_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ انصراف", callback_data="back_to_main")]
+        ]
+    )
     text = (
         "🎧 <b>پشتیبانی</b>\n\n"
         "لطفاً پیام خود را به صورت متن ارسال کنید.\n"
@@ -928,7 +1177,9 @@ async def process_support(callback: types.CallbackQuery, state: FSMContext, db_s
 
 
 @router.message(UserStates.waiting_for_support_message)
-async def process_support_message(message: types.Message, state: FSMContext, db_session: AsyncSession) -> None:
+async def process_support_message(
+    message: types.Message, state: FSMContext, db_session: AsyncSession
+) -> None:
     if not message.text or not message.from_user:
         return
 
@@ -966,7 +1217,9 @@ async def process_support_message(message: types.Message, state: FSMContext, db_
 # 🌟 سرویسهای من + مانیتورینگ زنده
 # ==========================================
 @router.callback_query(F.data == "my_services")
-async def process_my_services(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def process_my_services(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.from_user:
         await callback.answer()
         return
@@ -990,13 +1243,15 @@ async def process_my_services(callback: types.CallbackQuery, db_session: AsyncSe
     transactions = (await db_session.execute(stmt)).scalars().all()
 
     if not transactions:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]
-        ])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_main")]
+            ]
+        )
         if isinstance(callback.message, types.Message):
             await callback.message.edit_text(
                 "📦 <b>سرویسهای من</b>\n\nشما هنوز هیچ سرویسی خریداری نکرده‌اید.",
-                reply_markup=kb
+                reply_markup=kb,
             )
         await callback.answer()
         return
@@ -1011,13 +1266,15 @@ async def process_my_services(callback: types.CallbackQuery, db_session: AsyncSe
     if isinstance(callback.message, types.Message):
         await callback.message.edit_text(
             "📦 <b>سرویسهای من</b>\n\nبرای مشاهده جزئیات و وضعیت زنده، یک سرویس را انتخاب کنید:",
-            reply_markup=builder.as_markup()
+            reply_markup=builder.as_markup(),
         )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("usr_srv_"))
-async def process_service_monitoring(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def process_service_monitoring(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.data or not callback.from_user:
         await callback.answer()
         return
@@ -1062,10 +1319,20 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
     finally:
         await client.close()
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 بروزرسانی", callback_data=f"usr_srv_{tx.id}")],
-        [InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="my_services")],
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 بروزرسانی", callback_data=f"usr_srv_{tx.id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔙 بازگشت به لیست", callback_data="my_services"
+                )
+            ],
+        ]
+    )
 
     if api_data is None:
         text = (
@@ -1081,8 +1348,8 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
         expire_val = api_data.get("expire")
         status = str(api_data.get("status") or "unknown")
 
-        total_gb = data_limit / (1024 ** 3) if data_limit else 0.0
-        used_gb = used_traffic / (1024 ** 3) if used_traffic else 0.0
+        total_gb = data_limit / (1024**3) if data_limit else 0.0
+        used_gb = used_traffic / (1024**3) if used_traffic else 0.0
         remaining_gb = max(total_gb - used_gb, 0.0) if data_limit else 0.0
 
         remaining_days = 0
@@ -1139,7 +1406,9 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
 # 🎁 دریافت تست رایگان + Force-Join
 # ==========================================
 @router.callback_query(F.data == "free_test_start")
-async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def free_test_start(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.from_user or not callback.data:
         await callback.answer()
         return
@@ -1150,7 +1419,9 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
         await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
         return
 
-    stmt_channels = select(ForceJoinChannel).where(ForceJoinChannel.vendor_id == user.vendor_id)
+    stmt_channels = select(ForceJoinChannel).where(
+        ForceJoinChannel.vendor_id == user.vendor_id
+    )
     channels = (await db_session.execute(stmt_channels)).scalars().all()
 
     if not channels:
@@ -1166,14 +1437,22 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
     unjoined: List[ForceJoinChannel] = []
     for ch in channels:
         try:
-            member = await bot.get_chat_member(chat_id=ch.chat_id, user_id=user.telegram_id)
-            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            member = await bot.get_chat_member(
+                chat_id=ch.chat_id, user_id=user.telegram_id
+            )
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            ):
                 unjoined.append(ch)
         except TelegramBadRequest as e:
             logger.warning(f"Force-join check failed for channel {ch.chat_id} : {e}")
             unjoined.append(ch)
         except Exception as e:
-            logger.warning(f"Force-join membership check failed for channel {ch.chat_id}: {e}")
+            logger.warning(
+                f"Force-join membership check failed for channel {ch.chat_id}: {e}"
+            )
             unjoined.append(ch)
 
     if not unjoined:
@@ -1184,7 +1463,13 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
     kb_rows: List[List[InlineKeyboardButton]] = []
     for ch in unjoined:
         kb_rows.append([InlineKeyboardButton(text=ch.title, url=ch.url)])
-    kb_rows.append([InlineKeyboardButton(text="✅ بررسی مجدد عضویت", callback_data="free_test_verify")])
+    kb_rows.append(
+        [
+            InlineKeyboardButton(
+                text="✅ بررسی مجدد عضویت", callback_data="free_test_verify"
+            )
+        ]
+    )
     new_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
     text = "🔒 برای دریافت تست رایگان، ابتدا در کانالهای زیر عضو شوید:"
@@ -1198,7 +1483,9 @@ async def free_test_start(callback: types.CallbackQuery, db_session: AsyncSessio
 
 
 @router.callback_query(F.data == "free_test_verify")
-async def free_test_verify(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def free_test_verify(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.from_user or not callback.data:
         await callback.answer()
         return
@@ -1209,7 +1496,9 @@ async def free_test_verify(callback: types.CallbackQuery, db_session: AsyncSessi
         await callback.answer("❌ اطلاعات شما یافت نشد.", show_alert=True)
         return
 
-    stmt_channels = select(ForceJoinChannel).where(ForceJoinChannel.vendor_id == user.vendor_id)
+    stmt_channels = select(ForceJoinChannel).where(
+        ForceJoinChannel.vendor_id == user.vendor_id
+    )
     channels = (await db_session.execute(stmt_channels)).scalars().all()
 
     if not channels:
@@ -1225,14 +1514,22 @@ async def free_test_verify(callback: types.CallbackQuery, db_session: AsyncSessi
     unjoined: List[ForceJoinChannel] = []
     for ch in channels:
         try:
-            member = await bot.get_chat_member(chat_id=ch.chat_id, user_id=user.telegram_id)
-            if member.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            member = await bot.get_chat_member(
+                chat_id=ch.chat_id, user_id=user.telegram_id
+            )
+            if member.status not in (
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            ):
                 unjoined.append(ch)
         except TelegramBadRequest:
             logger.warning(f"Force-join check failed for channel {ch.chat_id}")
             unjoined.append(ch)
         except Exception as e:
-            logger.warning(f"Force-join membership check failed for channel {ch.chat_id}: {e}")
+            logger.warning(
+                f"Force-join membership check failed for channel {ch.chat_id}: {e}"
+            )
             unjoined.append(ch)
 
     if not unjoined:
@@ -1244,7 +1541,9 @@ async def free_test_verify(callback: types.CallbackQuery, db_session: AsyncSessi
 
 
 @router.callback_query(F.data == "free_test_servers")
-async def free_test_show_servers(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def free_test_show_servers(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.from_user or not callback.data:
         await callback.answer()
         return
@@ -1259,7 +1558,9 @@ async def free_test_show_servers(callback: types.CallbackQuery, db_session: Asyn
         await callback.answer("❌ شما قبلاً سرویس تست دریافت کردهاید.", show_alert=True)
         return
 
-    shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == user.vendor_id)
+    shared_subq = select(VendorServer.server_id).where(
+        VendorServer.vendor_id == user.vendor_id
+    )
     stmt_servers = select(Server).where(
         or_(Server.vendor_id == user.vendor_id, Server.id.in_(shared_subq)),
         Server.is_active == True,
@@ -1267,16 +1568,22 @@ async def free_test_show_servers(callback: types.CallbackQuery, db_session: Asyn
     )
     servers = (await db_session.execute(stmt_servers)).scalars().all()
 
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=BUTTONS["back_to_main"], callback_data="back_to_main")]
-    ])
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["back_to_main"], callback_data="back_to_main"
+                )
+            ]
+        ]
+    )
 
     if not servers:
         if isinstance(callback.message, types.Message):
             try:
                 await callback.message.edit_text(
                     "❌ در حال حاضر سرور فعالی برای تست موجود نیست.",
-                    reply_markup=back_kb
+                    reply_markup=back_kb,
                 )
             except TelegramBadRequest:
                 pass
@@ -1298,7 +1605,9 @@ async def free_test_show_servers(callback: types.CallbackQuery, db_session: Asyn
     )
     if isinstance(callback.message, types.Message):
         try:
-            await callback.message.edit_text(text=text, reply_markup=builder.as_markup())
+            await callback.message.edit_text(
+                text=text, reply_markup=builder.as_markup()
+            )
         except TelegramBadRequest:
             pass
 
@@ -1306,7 +1615,9 @@ async def free_test_show_servers(callback: types.CallbackQuery, db_session: Asyn
 
 
 @router.callback_query(F.data.startswith("req_test_"))
-async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSession) -> None:
+async def free_test_generate(
+    callback: types.CallbackQuery, db_session: AsyncSession
+) -> None:
     if not callback.from_user or not callback.data:
         await callback.answer()
         return
@@ -1330,22 +1641,29 @@ async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSes
     stmt_server = select(Server).where(Server.id == server_id)
     server = (await db_session.execute(stmt_server)).scalar_one_or_none()
     if not server or not server.is_active:
-        await callback.answer("❌ سرور مورد نظر یافت نشد یا غیرفعال است.", show_alert=True)
+        await callback.answer(
+            "❌ سرور مورد نظر یافت نشد یا غیرفعال است.", show_alert=True
+        )
         return
 
     await callback.answer("⏳ در حال ساخت کانفیگ تست...")
 
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=BUTTONS["back_to_main"], callback_data="back_to_main")]
-    ])
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=BUTTONS["back_to_main"], callback_data="back_to_main"
+                )
+            ]
+        ]
+    )
 
     bot = callback.bot
     if bot is None:
         if isinstance(callback.message, types.Message):
             try:
                 await callback.message.edit_text(
-                    "❌ خطای داخلی رخ داده است.",
-                    reply_markup=back_kb
+                    "❌ خطای داخلی رخ داده است.", reply_markup=back_kb
                 )
             except TelegramBadRequest:
                 pass
@@ -1377,7 +1695,9 @@ async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSes
         if api_result:
             sub_url = str(api_result.get("subscription_url", ""))
     except Exception as e:
-        logger.error(f"Free test create_user failed for user {user.telegram_id} on server {server.id}: {e}")
+        logger.error(
+            f"Free test create_user failed for user {user.telegram_id} on server {server.id}: {e}"
+        )
         api_result = None
     finally:
         await client.close()
@@ -1398,16 +1718,24 @@ async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSes
         )
 
         try:
-            import qrcode.constants as _qr_constants # type: ignore[import-untyped]
-            qr = qrcode.QRCode(version=1, error_correction=_qr_constants.ERROR_CORRECT_M, box_size=10, border=4) # type: ignore[call-overload]
+            import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=_qr_constants.ERROR_CORRECT_M,
+                box_size=10,
+                border=4,
+            )  # type: ignore[call-overload]
             qr.add_data(sub_url)
             qr.make(fit=True)
             qr_image = qr.make_image(fill_color="black", back_color="white")
             stream = io.BytesIO()
-            qr_image.save(stream, "PNG") # type: ignore[call-arg]
+            qr_image.save(stream, "PNG")  # type: ignore[call-arg]
             stream.seek(0)
             qr_file = BufferedInputFile(stream.read(), filename="test_sub_qr.png")
-            await bot.send_photo(chat_id=user.telegram_id, photo=qr_file, caption=caption)
+            await bot.send_photo(
+                chat_id=user.telegram_id, photo=qr_file, caption=caption
+            )
         except Exception as e:
             logger.error(f"Failed to generate/send test QR: {e}")
             await bot.send_message(chat_id=user.telegram_id, text=caption)
@@ -1416,7 +1744,7 @@ async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSes
             try:
                 await callback.message.edit_text(
                     "✅ کانفیگ تست با موفقیت ساخته شد و در پیوی شما ارسال شد.",
-                    reply_markup=back_kb
+                    reply_markup=back_kb,
                 )
             except TelegramBadRequest:
                 pass
@@ -1426,7 +1754,7 @@ async def free_test_generate(callback: types.CallbackQuery, db_session: AsyncSes
         try:
             await callback.message.edit_text(
                 "❌ ساخت کانفیگ تست ناموفق بود. لطفاً بعداً مجدداً تلاش کنید.",
-                reply_markup=back_kb
+                reply_markup=back_kb,
             )
         except TelegramBadRequest:
             pass
