@@ -62,26 +62,23 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
 
     kb = [
         [
-            InlineKeyboardButton(text="👥 مشتریان من", callback_data="admin_my_users"),
+            InlineKeyboardButton(text="👥 مدیریت مشتریان", callback_data="admin_my_customers"),
             InlineKeyboardButton(text=receipts_label, callback_data="admin_receipts")
-        ],
-        [
-            InlineKeyboardButton(text="🎁 کدهای تخفیف", callback_data="admin_discounts"),
-            InlineKeyboardButton(text="🔄 تنظیمات ریدایرکت", callback_data="admin_redirect")
-        ],
-        [
-            InlineKeyboardButton(text="⚙️ اطلاعات پرداخت من", callback_data="admin_payment_info"),
-            InlineKeyboardButton(text="📊 گزارش مالی", callback_data="admin_reports")
         ],
         [
             InlineKeyboardButton(text="🖥 مدیریت سرورها", callback_data="admin_view_servers"),
             InlineKeyboardButton(text="🛍 مدیریت پلنها", callback_data="admin_manage_plans")
         ],
         [
-            InlineKeyboardButton(text=tickets_label, callback_data="admin_support_tickets"),
+            InlineKeyboardButton(text="⚙️ اطلاعات پرداخت من", callback_data="admin_payment_info"),
+            InlineKeyboardButton(text="📊 گزارش مالی", callback_data="admin_reports")
         ],
         [
-            InlineKeyboardButton(text="👥 مدیریت مشتریان", callback_data="admin_my_customers"),
+            InlineKeyboardButton(text="🎁 کدهای تخفیف", callback_data="admin_discounts"),
+            InlineKeyboardButton(text="🔄 تنظیمات ریدایرکت", callback_data="admin_redirect")
+        ],
+        [
+            InlineKeyboardButton(text=tickets_label, callback_data="admin_support_tickets"),
             InlineKeyboardButton(text="🔒 عضویت اجباری", callback_data="admin_force_join"),
         ],
     ]
