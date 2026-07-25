@@ -439,7 +439,7 @@ async def admin_approve_transaction(
             chat_id=user.telegram_id,
             text=(
                 f"✅ <b>واریزی شما تایید شد!</b>\n\n"
-                f"مبلغ <code>{int(tx.amount):,}</code> تومان به کیف پول شما اضافه گردید.\n"
+                f"مبلغ <code>{(int(tx.amount) + random_fee):,}</code> تومان به کیف پول شما اضافه گردید.\n"
                 f"موجودی فعلی: <code>{int(user.wallet_balance):,}</code> تومان"
             ),
         )

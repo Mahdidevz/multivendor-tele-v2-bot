@@ -789,6 +789,9 @@ async def process_wallet_buy(
             f"🖥 سرور: {server.name}\n\n"
             f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
         )
+        back_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]
+        ])
         try:
             import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
 
@@ -809,18 +812,25 @@ async def process_wallet_buy(
                 await callback.message.delete()
             if callback.bot is not None:
                 await callback.bot.send_photo(
-                    chat_id=user.telegram_id, photo=qr_file, caption=caption
+                    chat_id=user.telegram_id,
+                    photo=qr_file,
+                    caption=caption,
+                    reply_markup=back_kb
                 )
         except Exception:
             if isinstance(callback.message, types.Message):
-                await callback.message.edit_text(caption)
+                await callback.message.edit_text(caption, reply_markup=back_kb)
     else:
         user.wallet_balance += final_price
         new_tx.status = "failed"
         await db_session.commit()
+        fail_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]
+        ])
         if isinstance(callback.message, types.Message):
             await callback.message.edit_text(
-                "❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
+                "❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد.",
+                reply_markup=fail_kb
             )
 
 
