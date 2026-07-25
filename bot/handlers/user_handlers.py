@@ -489,6 +489,7 @@ async def _create_purchase_invoice(
 
     random_fee = random.randint(1, 900)
     amount_with_fee = payable_via_card + random_fee
+    amount_with_fee_rial = amount_with_fee * 10
 
     new_tx = Transaction(
         user_id=user_id_db,
@@ -523,7 +524,7 @@ async def _create_purchase_invoice(
         f"💰 مبلغ قابل پرداخت: <code>{payable_via_card:,}</code> تومان\n\n"
         f"💳 لطفاً مبلغ زیر را به شماره کارت <b>{target_vendor.name}</b> واریز کنید:\n"
         f"<code>{target_vendor.card_number}</code>\n\n"
-        f"💵 <b>مبلغ دقیق واریز:</b> <code>{amount_with_fee:,}</code> تومان\n\n"
+        f"💵 <b>مبلغ دقیق واریز:</b> <code>{amount_with_fee:,}</code> تومان - (<code>{amount_with_fee_rial:,}</code> ریال)\n\n"
         f"⚠️ مبلغ {random_fee} تومان جهت شناسایی سیستمی اضافه شده است.\n"
         "📸 پس از واریز، عکس رسید را همینجا بفرستید تا کانفیگ صادر شود:"
     )
@@ -583,7 +584,7 @@ async def process_wallet_buy(callback: types.CallbackQuery, db_session: AsyncSes
         await callback.message.edit_text("⏳ در حال ارتباط با سرور و ساخت کانفیگ...")
 
     server = plan.server
-    username = f"U_{user.telegram_id}_{new_tx.id}"
+    username = f"U_{user.telegram_id}_{new_tx.id}_{int(new_tx.created_at.timestamp())}"
     data_limit_bytes = int(plan.volume_gb * (1024**3)) if plan.volume_gb > 0 else 0
 
     # 🌟 رفع خطای Type-Hinting مرزبان با ارسال String صریح به جای None
@@ -713,10 +714,11 @@ async def process_receipt_photo(message: types.Message, state: FSMContext, db_se
         server_name = transaction.plan.server.name if transaction.plan.server else "نامشخص"
         plan_text = f"خرید {transaction.plan.title} | سرور: {server_name} ({vol_str} / {transaction.plan.days} روز)"
 
+    amount_rial = int(transaction.amount) * 10
     caption = (
         f"🧾 <b>فیش واریزی جدید</b>\n\n"
         f"👤 آیدی کاربر: <code>{message.from_user.id}</code>\n"
-        f"💰 مبلغ واریز (رسید): <code>{int(transaction.amount):,}</code> تومان\n"
+        f"💰 مبلغ واریز (رسید): <code>{int(transaction.amount):,}</code> تومان - (<code>{amount_rial:,}</code> ریال)\n"
     )
     if wallet_used > 0:
         caption += f"💎 کسر شده از کیف پول: <code>{wallet_used:,}</code> تومان\n"
@@ -826,12 +828,12 @@ async def process_charge_amount(message: types.Message, state: FSMContext, db_se
     await db_session.refresh(new_tx)
 
     await state.update_data(transaction_id=new_tx.id, wallet_used=0)
-
+    final_amount_rial = final_amount * 10
     text = (
         f"🧾 <b>اطلاعات پرداخت</b>\n\n"
         f"💳 لطفاً مبلغ زیر را به شماره کارت <b>{target_vendor.name}</b> واریز کنید:\n"
         f"<code>{target_vendor.card_number}</code>\n\n"
-        f"💵 <b>مبلغ دقیق واریز:</b> <code>{final_amount:,}</code> تومان\n\n"
+        f"💵 <b>مبلغ دقیق واریز:</b> <code>{final_amount:,}</code> تومان - (<code>{final_amount_rial:,}</code> ریال)\n\n"
         f"⚠️ مبلغ {random_fee} تومان جهت شناسایی سیستمی اضافه شده است.\n"
         "📸 پس از واریز، عکس رسید خود را همینجا بفرستید:"
     )
@@ -1044,7 +1046,7 @@ async def process_service_monitoring(callback: types.CallbackQuery, db_session: 
         return
 
     server: Server = tx.plan.server
-    username = f"U_{tx.user.telegram_id}_{tx.id}"
+    username = f"U_{tx.user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
 
     client = MarzbanClient(
         base_url=server.panel_url,

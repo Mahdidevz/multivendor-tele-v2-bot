@@ -357,7 +357,7 @@ async def admin_approve_transaction(callback: types.CallbackQuery, db_session: A
 
 
         # 🌐 ساخت کاربر واقعی در پنل Marzban
-        username = f"U_{user.telegram_id}_{tx.id}"
+        username = f"U_{user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
         expire_timestamp = str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
         data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
 
@@ -2287,7 +2287,7 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
         return
 
     server: Server = tx.plan.server
-    username = f"U_{tx.user.telegram_id}_{tx.id}"
+    username = f"U_{tx.user.telegram_id}_{tx.id}_{int(tx.created_at.timestamp())}"
 
     client = MarzbanClient(base_url=server.panel_url, username=server.username, password=server.password)
     api_data: Dict[str, Any] | None = None
