@@ -4,7 +4,7 @@ import time
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, Optional
 
 import qrcode
 from aiogram import Router, types, F
@@ -36,8 +36,7 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
     owner_id_str = os.getenv("OWNER_ID")
     is_owner = bool(owner_id_str and user_id == int(owner_id_str))
 
-    # 🌟 [جدید] شمارش فیشها و تیکتهای در انتظار برای نمایش Badge
-    # نکته: فقط تراکنشهایی که واقعاً عکس فیش آپلود شده دارند شمرده میشوند
+    # 🌟 شمارش فیش‌ها و تیکت‌های در انتظار برای نمایش Badge
     pending_tx_count = await db_session.scalar(
         select(func.count(Transaction.id)).where(
             Transaction.vendor_id == vendor.id,
@@ -52,11 +51,9 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
         )
     )
 
-    # تبدیل به int (در صورت None بودن نتیجه scalar)
     pending_tx_count = int(pending_tx_count or 0)
     pending_ticket_count = int(pending_ticket_count or 0)
 
-    # 🌟 ساخت متن دکمهها با Badge
     receipts_label = f"💳 بررسی فیشها ({pending_tx_count})"
     tickets_label = f"📨 پیامهای پشتیبانی ({pending_ticket_count})"
 
@@ -92,7 +89,6 @@ async def get_admin_panel_content(user_id: int, db_session: AsyncSession):
     reply_markup = InlineKeyboardMarkup(inline_keyboard=kb)
 
     status_text = "🟢 فعال" if vendor.is_active else "🔴 غیرفعال"
-    # 🌟 [Bug 2 Fix] استفاده از redirect_target_id برای نمایش وضعیت ریدایرکت
     redirect_text = "ندارد" if not vendor.redirect_target_id else "روشن 🔄"
 
     text = (
@@ -130,7 +126,7 @@ async def close_panel(callback: types.CallbackQuery):
 
 
 # ==========================================
-# 🌟 [جدید] لیست فیشهای در انتظار (Pending Receipts)
+# 🌟 لیست فیش‌های در انتظار (Pending Receipts)
 # ==========================================
 @router.callback_query(F.data == "admin_receipts")
 async def admin_receipts_list(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -145,8 +141,6 @@ async def admin_receipts_list(callback: types.CallbackQuery, db_session: AsyncSe
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # واکشی تمام تراکنشهای pending این فروشنده بههمراه کاربر و پلن
-    # نکته: فقط تراکنشهایی که عکس فیش دارند (سبدهای رهاشده مستثنی میشوند)
     stmt = (
         select(Transaction)
         .options(
@@ -169,7 +163,6 @@ async def admin_receipts_list(callback: types.CallbackQuery, db_session: AsyncSe
         list_text = "💳 <b>فیشهای در انتظار</b>\n\nهیچ فیش جدیدی وجود ندارد."
         if isinstance(callback.message, types.Message):
             if callback.message.photo:
-                # بازگشت از صفحه فیش (عکس): کیبورد عکس پاک شود و لیست متن جدید ارسال گردد
                 try:
                     await callback.message.edit_reply_markup(reply_markup=None)
                 except TelegramBadRequest:
@@ -199,14 +192,12 @@ async def admin_receipts_list(callback: types.CallbackQuery, db_session: AsyncSe
 
     if isinstance(callback.message, types.Message):
         if callback.message.photo:
-            # 🌟 بازگشت از صفحه فیش: عکس در چت باقی بماند، فقط کیبوردش پاک شود و لیست متن جدید ارسال گردد
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest:
                 pass
             await callback.message.answer(text=list_text, reply_markup=list_kb)
         else:
-            # پیمایش عادی از منوهای متنی
             try:
                 await callback.message.edit_text(text=list_text, reply_markup=list_kb)
             except TelegramBadRequest:
@@ -249,7 +240,6 @@ async def admin_receipt_detail(callback: types.CallbackQuery, db_session: AsyncS
         await callback.answer("❌ کاربر مرتبط یافت نشد.", show_alert=True)
         return
 
-    # ساخت متن اطلاعات فیش
     plan_text = "شارژ عادی کیف پول"
     if tx.plan:
         plan_text = f"{tx.plan.title}"
@@ -257,13 +247,13 @@ async def admin_receipt_detail(callback: types.CallbackQuery, db_session: AsyncS
     caption = (
         f"🧾 <b>بررسی فیش</b>\n\n"
         f"👤 <b>کاربر:</b> <code>{user.telegram_id}</code>\n"
-        f"💰 <b>مبلغ نهایی:</b> <code>{int(tx.amount):,}</code> تومان\n"
+        f"💰 <b>مبلغ واریز به کارت:</b> <code>{int(tx.amount):,}</code> تومان\n"
     )
-    # 🌟 نمایش اطلاعات تخفیف در صورت وجود
+
     if tx.discount_percent and tx.discount_percent > 0:
         caption += (
-            f"💵 <b>قیمت اصلی:</b> <code>{int(tx.original_amount):,}</code> تومان\n"
-            f"🎯 <b>تخفیف ({tx.discount_percent}%):</b> <code>{int(tx.original_amount - int(tx.amount)):,}</code> تومان\n"
+            f"💵 <b>قیمت اصلی پلن:</b> <code>{int(tx.original_amount):,}</code> تومان\n"
+            f"🎯 <b>درصد تخفیف:</b> {tx.discount_percent}%\n"
         )
     caption += (
         f"📌 <b>بابت:</b> {plan_text}\n"
@@ -278,11 +268,9 @@ async def admin_receipt_detail(callback: types.CallbackQuery, db_session: AsyncS
         [InlineKeyboardButton(text="🔙 بازگشت به لیست", callback_data="admin_receipts")],
     ])
 
-    # حذف کیبورد پیام فعلی
     if isinstance(callback.message, types.Message):
         await callback.message.edit_reply_markup(reply_markup=None)
 
-    # ارسال عکس فیش به همراه دکمههای تایید/رد
     if tx.receipt_file_id:
         try:
             await bot.send_photo(
@@ -293,13 +281,232 @@ async def admin_receipt_detail(callback: types.CallbackQuery, db_session: AsyncS
             )
         except Exception as e:
             logger.error(f"Failed to send receipt photo for tx {tx_id}: {e}")
-            # fallback: ارسال فقط متن
             await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=kb)
     else:
-        # اگر عکس نداشت، فقط متن بفرست
         await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=kb)
 
     await callback.answer()
+
+
+# ==========================================
+# 🌟 تایید و رد فیش (مجهز به سیستم محاسباتی هوشمند)
+# ==========================================
+@router.callback_query(F.data.startswith("admin_approve_tx_"))
+async def admin_approve_transaction(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    tx_id_str = callback.data.replace("admin_approve_tx_", "")
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    tx_id = int(tx_id_str)
+
+    stmt = select(Transaction).options(
+        selectinload(Transaction.user),
+        selectinload(Transaction.plan).selectinload(Plan.server)
+    ).where(Transaction.id == tx_id)
+
+    tx = (await db_session.execute(stmt)).scalar_one_or_none()
+
+    if not tx or tx.status != "pending":
+        await callback.answer("❌ این فیش قبلاً بررسی شده یا وجود ندارد.", show_alert=True)
+        return
+
+    user = tx.user
+    if not user:
+        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
+        return
+
+    bot = callback.bot
+    if not bot:
+        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
+        return
+
+    tx.status = "approved"
+
+    if not tx.plan_id:
+        # 🌟 شارژ عادی کیف پول (بدون خرید پلن)
+        user.wallet_balance += int(tx.amount)
+        await db_session.commit()
+
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest:
+                pass
+
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                f"✅ <b>واریزی شما تایید شد!</b>\n\n"
+                f"مبلغ <code>{int(tx.amount):,}</code> تومان به کیف پول شما اضافه گردید.\n"
+                f"موجودی فعلی: <code>{int(user.wallet_balance):,}</code> تومان"
+            ),
+        )
+        tx.receipt_file_id = None
+        await db_session.commit()
+    else:
+        # 🌟 خرید پلن (مخلوط کارت + کیف پول)
+        plan = tx.plan
+        if not plan or not plan.server:
+            await callback.answer("❌ پلن یا سرور مرتبط یافت نشد.", show_alert=True)
+            return
+        server = plan.server
+
+
+        # 🌐 ساخت کاربر واقعی در پنل Marzban
+        username = f"U_{user.telegram_id}_{tx.id}"
+        expire_timestamp = str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
+        data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
+
+        sub_url = ""
+        client = MarzbanClient(
+            base_url=server.panel_url,
+            username=server.username,
+            password=server.password,
+        )
+        try:
+            await client.login()
+            api_result = await client.create_user(
+                username=username,
+                data_limit_bytes=data_limit_bytes,
+                expire_iso=expire_timestamp,
+                hwid_limit=plan.user_limit,
+            )
+            sub_url = str(api_result.get("subscription_url", ""))
+            if not sub_url:
+                sub_url = "خطا در دریافت لینک اشتراک از پنل."
+        except Exception as e:
+            logger.error(f"Failed to create Marzban user {username}: {e}")
+            sub_url = f"خطا در ارتباط با پنل: {e}"
+        finally:
+            await client.close()
+
+        if isinstance(callback.message, types.Message):
+            try:
+                await callback.message.delete()
+            except TelegramBadRequest:
+                pass
+
+        msg_to_user = (
+            f"✅ <b>پرداخت شما تایید شد!</b>\n\n"
+            f"🛍 <b>سرویس:</b> {plan.title}\n"
+        )
+
+        if tx.discount_percent and tx.discount_percent > 0:
+            discount_amount = int(tx.original_amount) * int(tx.discount_percent) // 100
+            msg_to_user += (
+                f"💵 قیمت اصلی: <code>{int(tx.original_amount):,}</code> تومان\n"
+                f"🎯 تخفیف ({tx.discount_percent}%): <code>-{discount_amount:,}</code> تومان\n"
+            )
+
+        msg_to_user += (
+            f"🔗 <b>لینک اشتراک شما:</b>\n<code>{sub_url}</code>\n\n"
+            f"💡 آموزش اتصال: ابتدا لینک بالا را کپی کرده و در نرم‌افزار خود وارد کنید."
+        )
+
+        # تولید QR Code
+        if isinstance(callback.message, types.Message):
+            try:
+                import qrcode.constants as _qr_constants # type: ignore[import-untyped]
+                qr = qrcode.QRCode(version=1, error_correction=_qr_constants.ERROR_CORRECT_M, box_size=10, border=4) # type: ignore[call-overload]
+                qr.add_data(sub_url)
+                qr.make(fit=True)
+                qr_image = qr.make_image(fill_color="black", back_color="white")
+                stream = io.BytesIO()
+                qr_image.save(stream, "PNG") # type: ignore[call-arg]
+                stream.seek(0)
+                qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
+
+                await bot.send_photo(
+                    chat_id=user.telegram_id,
+                    photo=qr_file,
+                    caption=msg_to_user,
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate/send QR code for tx {tx_id}: {e}")
+                await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
+
+        tx.receipt_file_id = None
+        await db_session.commit()
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_reject_tx_"))
+async def admin_reject_transaction(callback: types.CallbackQuery, db_session: AsyncSession):
+    if not callback.data or not callback.from_user:
+        await callback.answer()
+        return
+
+    tx_id_str = callback.data.replace("admin_reject_tx_", "")
+    if not tx_id_str.isdigit():
+        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
+        return
+    tx_id = int(tx_id_str)
+
+    tx = (
+        await db_session.execute(
+            select(Transaction)
+            .options(selectinload(Transaction.user))
+            .where(Transaction.id == tx_id)
+        )
+    ).scalar_one_or_none()
+
+    if not tx or tx.status != "pending":
+        await callback.answer("❌ فیش قبلاً بررسی شده.", show_alert=True)
+        return
+
+    user = tx.user
+    if not user:
+        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
+        return
+
+    bot = callback.bot
+    if not bot:
+        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
+        return
+
+    # ---------------------------------------------------------
+    # 🌟 [سیستم بازگشت وجه - Refund]:
+    # اگر کاربر برای خرید پلن، بخشی از هزینه را از کیف پول داده و سپس فیش را برای بقیه پول ارسال کرده بوده،
+    # پولی که از کیف پولش بلاک (کسر) شده را محاسبه و دوباره به حسابش واریز (Refund) می‌کنیم!
+    # ---------------------------------------------------------
+    if tx.plan_id:
+            # ۱. قیمت واقعی پلن بعد از تخفیف را در می‌آوریم
+            actual_plan_price = int(tx.original_amount) - (int(tx.original_amount) * int(tx.discount_percent or 0) // 100)
+
+            # ۲. مبلغی که باید به کارت واریز می‌شده دقیقاً tx.amount است (بدون کارمزد رندوم)
+            payable_via_card = int(tx.amount)
+
+            # ۳. پس پولی که از کیف پول کاربر بلاک شده بوده دقیقاً اختلاف این دو عدد است:
+            wallet_used = actual_plan_price - payable_via_card
+
+            # ۴. اگر پولی درگیر بوده، دقیقاً همان مقدار را به حسابش برمی‌گردانیم
+            if wallet_used > 0:
+                user.wallet_balance += wallet_used
+    tx.status = "rejected"
+    await db_session.commit()
+
+    if isinstance(callback.message, types.Message):
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
+
+    if isinstance(callback.message, types.Message):
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                f"❌ <b>پرداخت شما تایید نشد.</b>\n\n"
+                f"فیش ارسالی برای مبلغ <code>{int(tx.amount):,}</code> تومان توسط پشتیبانی رد شد.\n"
+                "در صورتی که مبلغی از کیف پول شما کسر شده بود، به حساب شما بازگردانده شد."
+            ),
+        )
+    await callback.answer()
+
 
 # ==========================================
 # 🌟 اطلاعات پرداخت ادمین
@@ -329,14 +536,14 @@ async def process_vendor_card(message: types.Message, state: FSMContext, db_sess
         await message.answer(f"✅ شماره کارت با موفقیت به <code>{new_card}</code> تغییر یافت.")
     await state.clear()
 
-    # بازگشت خودکار
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
     if text: await message.answer(text, reply_markup=reply_markup)
 
 
 # ==========================================
-# 🌟 مدیریت سرورها
+# 🌟 بقیه توابع مدیریتی بدون تغییر و ایمن
 # ==========================================
+
 @router.callback_query(F.data == "admin_view_servers")
 async def admin_view_servers(callback: types.CallbackQuery, db_session: AsyncSession):
     if not callback.from_user:
@@ -351,9 +558,6 @@ async def admin_view_servers(callback: types.CallbackQuery, db_session: AsyncSes
     owner_id_str = os.getenv("OWNER_ID")
     is_owner = bool(owner_id_str and callback.from_user.id == int(owner_id_str))
 
-    # 🌟 سرورهای قابل دسترس برای این فروشنده:
-    #   a) سرورهایی که خودش مالک آن است (Server.vendor_id == vendor.id)
-    #   b) سرورهایی که از طریق جدول VendorServer با او اشتراک داده شده است
     shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
     stmt = select(Server).where(
         or_(
@@ -371,7 +575,6 @@ async def admin_view_servers(callback: types.CallbackQuery, db_session: AsyncSes
 
     for srv in servers:
         icon = "🟢" if srv.is_active else "🔴"
-        # 🌟 نمایش «مالک/اشتراکی» بر اساس مالکیت واقعی
         ownership = "مالک" if srv.vendor_id == vendor.id else "اشتراکی"
         kb.append([InlineKeyboardButton(text=f"{icon} {srv.name} ({ownership})", callback_data=f"srv_det_{srv.id}")])
 
@@ -390,7 +593,6 @@ async def start_add_server(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # 🌟 «selective» یعنی فلو مالک با اشتراک‌گذاری انتخابی؛ «private» یعنی سرور اختصاصی بدون اشتراک
     is_selective = (callback.data == "add_srv_selective")
     await state.update_data(is_selective=is_selective, is_private=(not is_selective))
 
@@ -438,7 +640,6 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
         await state.clear()
         return
 
-    # 🌟 تست واقعی اتصال به API قبل از ثبت سرور
     srv_url: str = str(data.get("srv_url", ""))
     srv_user: str = str(data.get("srv_user", ""))
     is_connected = await _test_marzban_connection(srv_url, srv_user, password)
@@ -456,9 +657,7 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
 
     is_selective = bool(data.get("is_selective", False))
 
-    # 🌟 برای فلو Owner (selective): پس از موفقیت API، به مرحله انتخاب شرکا منتقل میشویم.
     if is_selective:
-        # استخراج لیست شرکای فعال (به جز خود مالک)
         stmt_vendors = select(Vendor).where(
             Vendor.is_active == True,
             Vendor.id != vendor.id
@@ -466,7 +665,6 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
         all_vendors = (await db_session.execute(stmt_vendors)).scalars().all()
 
         if not all_vendors:
-            # شرکایی وجود ندارند؛ سرور را بدون اشتراک ثبت میکنیم
             new_srv = Server(
                 vendor_id=vendor.id,
                 is_shared=False,
@@ -481,7 +679,7 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
 
             await message.answer(
                 "✅ <b>سرور ثبت شد.</b>\n"
-                "ℹ️ هیچ شرک فعالی برای اشتراکگذاری وجود نداشت، بنابراین سرور اختصاصی شما باقی ماند."
+                "ℹ️ هیچ شریک فعالی برای اشتراک‌گذاری وجود نداشت، بنابراین سرور اختصاصی شما باقی ماند."
             )
             await state.clear()
             text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
@@ -489,17 +687,16 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
                 await message.answer(text, reply_markup=reply_markup)
             return
 
-        # ذخیره رمز عبور و شناسه مالک برای مرحله نهایی
         await state.update_data(
             srv_password=password,
             owner_vendor_id=vendor.id,
-            selected_vendor_ids=[],  # مجموعه خالی از انتخابها
+            selected_vendor_ids=[],
         )
 
         kb = _build_vendor_selection_keyboard(all_vendors, selected_ids=[])
         if isinstance(message, types.Message):
             await message.answer(
-                "👥 <b>مرحله اشتراکگذاری انتخابی</b>\n\n"
+                "👥 <b>مرحله اشتراک‌گذاری انتخابی</b>\n\n"
                 "سرور با موفقیت به API متصل شد.\n"
                 "اکنون انتخاب کنید کدام شرکا به این سرور دسترسی داشته باشند:\n"
                 "✅ = انتخاب شده | ⬜ = انتخاب نشده",
@@ -508,7 +705,6 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
         await state.set_state(AddServerStates.waiting_for_vendor_selection)
         return
 
-    # 🌟 برای فلو private (یا غیر-owner): ثبت مستقیم سرور اختصاصی
     new_srv = Server(
         vendor_id=vendor.id,
         is_shared=False,
@@ -530,14 +726,8 @@ async def srv_pass(message: types.Message, state: FSMContext, db_session: AsyncS
 
 
 async def _test_marzban_connection(base_url: str, username: str, password: str) -> bool:
-    """
-    تست اتصال به پنل Marzban قبل از ثبت سرور.
-    در صورت موفقیت True و در غیر این صورت False برمیگرداند.
-    """
-    # گارد: بررسی مقادیر ورودی خالی
     if not base_url or not username or not password:
         return False
-
     client = MarzbanClient(base_url=base_url, username=username, password=password)
     is_connected = False
     try:
@@ -550,10 +740,7 @@ async def _test_marzban_connection(base_url: str, username: str, password: str) 
     return is_connected
 
 
-def _build_vendor_selection_keyboard(
-    vendors: Sequence[Vendor], selected_ids: list[int]
-) -> InlineKeyboardMarkup:
-    """ساخت کیبورد انتخاب شرکا با حالت toggle."""
+def _build_vendor_selection_keyboard(vendors: Sequence[Vendor], selected_ids: list[int]) -> InlineKeyboardMarkup:
     kb: list[list[InlineKeyboardButton]] = []
     for v in vendors:
         mark = "✅" if v.id in selected_ids else "⬜"
@@ -590,7 +777,6 @@ async def toggle_vendor_in_sharing(callback: types.CallbackQuery, state: FSMCont
 
     await state.update_data(selected_vendor_ids=selected_ids)
 
-    # بازسازی کیبورد با انتخاب جدید
     stmt_vendors = select(Vendor).where(
         Vendor.is_active == True,
         Vendor.id != data.get("owner_vendor_id")
@@ -610,8 +796,6 @@ async def save_server_with_vendor_sharing(callback: types.CallbackQuery, state: 
         return
 
     data = await state.get_data()
-
-    # گارد: بررسی وجود تمام کلیدهای لازم در FSM
     required_keys = ("srv_name", "srv_url", "srv_user", "srv_password", "owner_vendor_id")
     if not all(k in data for k in required_keys):
         await callback.answer("❌ اطلاعات سرور ناقص است. لطفاً دوباره تلاش کنید.", show_alert=True)
@@ -624,10 +808,9 @@ async def save_server_with_vendor_sharing(callback: types.CallbackQuery, state: 
     owner_vendor_id: int = int(data["owner_vendor_id"])
     selected_vendor_ids: list[int] = list(data.get("selected_vendor_ids", []))
 
-    # ساخت و ذخیره سرور مالک
     new_srv = Server(
         vendor_id=owner_vendor_id,
-        is_shared=False,  # دیگر سرور عمومی نیست؛ اشتراک انتخابی است
+        is_shared=False,
         name=data["srv_name"],
         panel_url=data["srv_url"],
         username=data["srv_user"],
@@ -635,9 +818,8 @@ async def save_server_with_vendor_sharing(callback: types.CallbackQuery, state: 
         is_active=True,
     )
     db_session.add(new_srv)
-    await db_session.flush()  # گرفتن new_srv.id بدون بستن تراکنش
+    await db_session.flush()
 
-    # ساخت روابط اشتراک‌گذاری در جدول VendorServer
     for vid in selected_vendor_ids:
         db_session.add(VendorServer(vendor_id=vid, server_id=new_srv.id))
 
@@ -650,7 +832,6 @@ async def save_server_with_vendor_sharing(callback: types.CallbackQuery, state: 
             f"👥 تعداد شرکای دسترسی‌یافته: <b>{len(selected_vendor_ids)}</b>"
         )
 
-    # 🌟 بازگشت خودکار به پنل ادمین
     text, reply_markup = await get_admin_panel_content(callback.from_user.id, db_session)
     if text and isinstance(callback.message, types.Message):
         await callback.message.answer(text, reply_markup=reply_markup)
@@ -668,7 +849,6 @@ async def admin_server_details(callback: types.CallbackQuery, db_session: AsyncS
         await callback.answer("❌ شناسه سرور نامعتبر است.", show_alert=True)
         return
 
-    # 🌟 بارگذاری سرور بههمراه روابط vendor و vendor_servers.vendor برای جلوگیری از خطای Lazy Load در Async
     stmt = (
         select(Server)
         .options(
@@ -688,7 +868,6 @@ async def admin_server_details(callback: types.CallbackQuery, db_session: AsyncS
     status_text = "🟢 در حال کار" if server.is_active else "🔴 غیرفعال"
     type_text = "اشتراکی (عمومی)" if server.is_shared else "اختصاصی"
 
-    # 🌟 فهرست شرکایی که این سرور با آنها اشتراک داده شده است
     shared_vendors: list[Vendor] = [vs.vendor for vs in server.vendor_servers if vs.vendor is not None]
     if shared_vendors:
         shared_names = "\n".join(f"   • {v.name}" for v in shared_vendors)
@@ -705,7 +884,6 @@ async def admin_server_details(callback: types.CallbackQuery, db_session: AsyncS
         f"📊 در اینجا اطلاعات منابع از طریق API لود خواهد شد...\n"
     )
 
-    # 🌟 بررسی مالکیت: فقط مالک سرور یا Owner رسمی میتواند ویرایش کند
     server_owner_tg_id = server.vendor.telegram_id if server.vendor else None
     can_manage = bool(is_owner or (server_owner_tg_id is not None and server_owner_tg_id == callback.from_user.id))
 
@@ -739,9 +917,6 @@ async def toggle_server_status(callback: types.CallbackQuery, db_session: AsyncS
 
     server.is_active = not server.is_active
 
-    # 🌟 [جدید] Cascading Plan Deactivation:
-    # اگر سرور غیرفعال شد، تمام پلنهای متصل به آن نیز غیرفعال شوند.
-    # ولی اگر سرور مجدداً فعال شد، پلنها بهصورت خودکار فعال نمیشوند.
     if not server.is_active:
         await db_session.execute(
             update(Plan).where(Plan.server_id == server.id).values(is_active=False)
@@ -749,7 +924,6 @@ async def toggle_server_status(callback: types.CallbackQuery, db_session: AsyncS
 
     await db_session.commit()
 
-    # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
     new_callback = callback.model_copy(update={"data": f"srv_det_{server.id}"})
     await admin_server_details(new_callback, db_session)
 
@@ -771,7 +945,6 @@ async def delete_server(callback: types.CallbackQuery, db_session: AsyncSession)
         await callback.answer("❌ سرور یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Soft Delete] حذف نرم سرور + آبشاری کردن روی پلنها
     server.is_deleted = True
     server.is_active = False
     await db_session.execute(
@@ -810,9 +983,6 @@ async def add_plan_select_server(callback: types.CallbackQuery, db_session: Asyn
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # 🌟 سرورهای قابل دسترس برای این فروشنده (فعال):
-    #   a) مستقیماً متعلق به فروشنده است (Server.vendor_id == vendor.id)
-    #   b) از طریق جدول VendorServer با او اشتراک داده شده است
     shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
     stmt = select(Server).where(
         Server.is_active == True,
@@ -830,7 +1000,6 @@ async def add_plan_select_server(callback: types.CallbackQuery, db_session: Asyn
 
     kb: list[list[InlineKeyboardButton]] = []
     for srv in servers:
-        # 🌟 نوع دسترسی را بر اساس مالکیت نمایش میدهیم
         ownership = "مالک" if srv.vendor_id == vendor.id else "اشتراکی"
         kb.append([InlineKeyboardButton(text=f"🖥 {srv.name} ({ownership})", callback_data=f"addp_s_{srv.id}")])
 
@@ -915,42 +1084,43 @@ async def plan_description(message: types.Message, state: FSMContext, db_session
     data = await state.get_data()
     desc = message.text.strip() if message.text.strip() != "ندارد" else None
 
+    server_id_raw = data.get('server_id')
+    title_val = data.get('title')
+    volume_val = data.get('volume')
+    days_val = data.get('days')
+    user_limit_val = data.get('user_limit')
+    price_val = data.get('price')
+
+    if server_id_raw is None or title_val is None or volume_val is None or days_val is None or user_limit_val is None or price_val is None:
+        await message.answer("❌ خطایی رخ داد. اطلاعات ناقص است.")
+        await state.clear()
+        return
+
     new_plan = Plan(
         vendor_id=vendor.id,
-        server_id=data['server_id'],
-        title=data['title'],
-        volume_gb=data['volume'],
-        days=data['days'],
-        user_limit=data['user_limit'],
-        price=data['price'],
+        server_id=int(server_id_raw),
+        title=str(title_val),
+        volume_gb=float(volume_val),
+        days=int(days_val),
+        user_limit=int(user_limit_val),
+        price=float(price_val),
         description=desc
     )
     db_session.add(new_plan)
     await db_session.commit()
 
-    await message.answer(f"✅ <b>پلن شما ساخته شد!</b>\nنام: {data['title']}")
+    await message.answer(f"✅ <b>پلن شما ساخته شد!</b>\nنام: {title_val}")
     await state.clear()
 
-    # 🌟 بازگشت خودکار به پنل ادمین
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
     if text: await message.answer(text, reply_markup=reply_markup)
 
 
-# ==========================================
-# 🌟 [Co-Ownership Model] Helper: اعتبارسنجی دسترسی اشتراکی به پلن
-# ==========================================
 async def _check_plan_access(
     db_session: AsyncSession,
     plan_id: int,
     admin_vendor_id: int,
-) -> tuple[Plan | None, bool]:
-    """بررسی دسترسی فروشنده به پلن بر اساس مالکیت/اشتراک سرور.
-
-    بازگشت: (plan, has_access)
-    - اگر پلن وجود نداشته باشد → (None, False)
-    - اگر پلن وجود داشته اما سرور آن در دسترس فروشنده نباشد → (plan, False)
-    - اگر دسترسی باشد → (plan, True)
-    """
+) -> tuple[Optional[Plan], bool]:
     plan = (
         await db_session.execute(
             select(Plan)
@@ -983,8 +1153,6 @@ async def admin_view_categories_by_server(callback: types.CallbackQuery, db_sess
     vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if not vendor: return
 
-    # 🌟 [Co-Ownership Model] سرورهایی که پلن فعال دارند و برای این فروشنده قابلدسترس هستند
-    # دسترسی بر اساس مالکیت سرور یا اشتراک از طریق VendorServer بررسی میشود، نه سازنده پلن.
     shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
     stmt = (
         select(Server)
@@ -1024,8 +1192,6 @@ async def admin_view_plans_in_server(callback: types.CallbackQuery, db_session: 
     vendor = (await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))).scalar_one_or_none()
     if not vendor: return
 
-    # 🌟 [Co-Ownership Model] پلنهای سرور انتخابشده — بدون فیلتر سازنده پلن
-    # فقط دسترسی فروشنده به سرور بررسی میشود.
     shared_subq = select(VendorServer.server_id).where(VendorServer.vendor_id == vendor.id)
     stmt = (
         select(Plan)
@@ -1066,7 +1232,6 @@ async def admin_show_plan_details(callback: types.CallbackQuery, db_session: Asy
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی بر اساس سرور، نه سازنده پلن
     plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
     if not plan:
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
@@ -1083,7 +1248,7 @@ async def admin_show_plan_details(callback: types.CallbackQuery, db_session: Asy
     text = (
         f"⚙️ <b>مدیریت پلن</b>\n\n"
         f"🔹 <b>نام:</b> {plan.title}\n"
-        f"🖥 <b>سرور מתصل:</b> {plan.server.name}\n"
+        f"🖥 <b>سرور متصل:</b> {plan.server.name}\n"
         f"💽 <b>حجم:</b> {vol} | ⏳ <b>اعتبار:</b> {days}\n"
         f"👥 <b>محدودیت:</b> {ulimit}\n"
         f"💵 <b>قیمت:</b> <code>{int(plan.price):,}</code> تومان\n"
@@ -1123,7 +1288,6 @@ async def admin_toggle_plan(callback: types.CallbackQuery, db_session: AsyncSess
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی بر اساس سرور
     plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
     if not plan:
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
@@ -1135,7 +1299,6 @@ async def admin_toggle_plan(callback: types.CallbackQuery, db_session: AsyncSess
     plan.is_active = not plan.is_active
     await db_session.commit()
 
-    # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
     new_callback = callback.model_copy(update={"data": f"adm_p_{plan.id}"})
     await admin_show_plan_details(new_callback, db_session)
 
@@ -1160,7 +1323,6 @@ async def admin_delete_plan(callback: types.CallbackQuery, db_session: AsyncSess
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی بر اساس سرور
     plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
     if not plan:
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
@@ -1170,14 +1332,12 @@ async def admin_delete_plan(callback: types.CallbackQuery, db_session: AsyncSess
         return
 
     srv_id = plan.server_id
-    # 🌟 [Soft Delete] حذف نرم پلن
     plan.is_deleted = True
     plan.is_active = False
     await db_session.commit()
 
     await callback.answer("✅ حذف شد.", show_alert=True)
 
-    # 🌟 استفاده از model_copy به جای تغییر مستقیم callback.data (Pydantic Frozen Instance)
     new_callback = callback.model_copy(update={"data": f"adm_cat_{srv_id}"})
     await admin_view_plans_in_server(new_callback, db_session)
 
@@ -1193,7 +1353,6 @@ async def admin_edit_price(callback: types.CallbackQuery, state: FSMContext, db_
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی قبل از ورود به FSM
     plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
     if not plan:
         await callback.answer("❌ پلن یافت نشد.", show_alert=True)
@@ -1215,14 +1374,15 @@ async def admin_process_new_price(message: types.Message, state: FSMContext, db_
         await message.answer("❌ فقط عدد وارد کنید.")
         return
     data = await state.get_data()
-    plan_id = data.get("edit_plan_id")
-    if plan_id:
-        # 🌟 [Co-Ownership Model] اعتبارسنجی دسترسی مجدد داخل FSM (جلوگیری از جعل state)
+    plan_id_raw = data.get("edit_plan_id")
+
+    if plan_id_raw is not None:
+        plan_id = int(plan_id_raw)
         vendor = (
             await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))
         ).scalar_one_or_none()
         if vendor:
-            plan, has_access = await _check_plan_access(db_session, int(plan_id), vendor.id)
+            plan, has_access = await _check_plan_access(db_session, plan_id, vendor.id)
             if plan and has_access:
                 plan.price = float(message.text)
                 await db_session.commit()
@@ -1237,233 +1397,7 @@ async def admin_process_new_price(message: types.Message, state: FSMContext, db_
 
 
 # ==========================================
-# 🌟 تایید و رد فیش (با API واقعی)
-# ==========================================
-@router.callback_query(F.data.startswith("admin_approve_tx_"))
-async def admin_approve_transaction(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data or not callback.from_user:
-        await callback.answer()
-        return
-
-    tx_id_str = callback.data.replace("admin_approve_tx_", "")
-    if not tx_id_str.isdigit():
-        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
-        return
-    tx_id = int(tx_id_str)
-
-    stmt = select(Transaction).options(
-        selectinload(Transaction.user),
-        selectinload(Transaction.plan).selectinload(Plan.server)
-    ).where(Transaction.id == tx_id)
-
-    tx = (await db_session.execute(stmt)).scalar_one_or_none()
-
-    if not tx or tx.status != "pending":
-        await callback.answer("❌ این فیش قبلاً بررسی شده یا وجود ندارد.", show_alert=True)
-        return
-
-    # 🌟 گارد امنیتی: کاربر حتماً باید بارگذاری شده باشد
-    user = tx.user
-    if not user:
-        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
-        return
-
-    bot = callback.bot
-    if not bot:
-        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
-        return
-
-    tx.status = "approved"
-
-    if not tx.plan_id:
-        # 🌟 شارژ عادی کیف پول (بدون پلن)
-        user.wallet_balance += tx.amount
-        await db_session.commit()
-
-        if isinstance(callback.message, types.Message):
-            # 🌟 حذف پیام عکس فیش از چت ادمین برای جلوگیری از شلوغی
-            try:
-                await callback.message.delete()
-            except TelegramBadRequest:
-                pass
-
-        await bot.send_message(
-            chat_id=user.telegram_id,
-            text=(
-                f"✅ <b>واریزی شما تایید شد!</b>\n\n"
-                f"مبلغ <code>{tx.amount:,}</code> تومان به کیف پول شما اضافه گردید.\n"
-                f"موجودی فعلی: <code>{int(user.wallet_balance):,}</code> تومان"
-            ),
-        )
-
-        # 🌟 پاک کردن مرجع عکس فیش (حفظ سابقه مالی، حذف فقط برای صرفهجویی در فضا)
-        tx.receipt_file_id = None
-        await db_session.commit()
-    else:
-        # 🌟 خرید پلن: کسر مبلغ از کیف پول + ساخت کاربر واقعی در پنل
-        plan = tx.plan
-        if not plan or not plan.server:
-            await callback.answer("❌ پلن یا سرور مرتبط یافت نشد.", show_alert=True)
-            return
-
-        server = plan.server
-
-        # 🌟 [Bug Fix Phase 4] کسر هزینه واقعی با درنظرگرفتن تخفیف (نه قیمت کامل پلن)
-        # منطق: original_amount - (original_amount * discount_percent // 100) == مبلغ نهایی پرداختی
-        actual_cost = tx.original_amount - (tx.original_amount * tx.discount_percent // 100)
-        user.wallet_balance += tx.amount
-        user.wallet_balance -= actual_cost
-        await db_session.commit()
-
-        # ---------------------------------------------------------
-        # 🌐 ساخت کاربر واقعی در پنل Marzban
-        # ---------------------------------------------------------
-        username = f"U_{user.telegram_id}_{tx.id}"
-        expire_timestamp = str(int(time.time()) + (plan.days * 86400)) if plan.days > 0 else "0"
-        data_limit_bytes = int(plan.volume_gb * 1073741824) if plan.volume_gb > 0 else 0
-
-        sub_url = ""
-        client = MarzbanClient(
-            base_url=server.panel_url,
-            username=server.username,
-            password=server.password,
-        )
-        try:
-            await client.login()
-            api_result = await client.create_user(
-                username=username,
-                data_limit_bytes=data_limit_bytes,
-                expire_iso=expire_timestamp,
-                hwid_limit=plan.user_limit,
-            )
-            sub_url = str(api_result.get("subscription_url", ""))
-            if not sub_url:
-                sub_url = "خطا در دریافت لینک اشتراک از پنل."
-        except Exception as e:
-            logger.error(f"Failed to create Marzban user {username}: {e}")
-            sub_url = f"خطا در ارتباط با پنل: {e}"
-        finally:
-            await client.close()
-
-        if isinstance(callback.message, types.Message):
-            # 🌟 حذف پیام عکس فیش از چت ادمین برای جلوگیری از شلوغی
-            try:
-                await callback.message.delete()
-            except TelegramBadRequest:
-                pass
-
-        msg_to_user = (
-            f"✅ <b>پرداخت شما تایید شد!</b>\n\n"
-            f"🛍 <b>سرویس:</b> {plan.title}\n"
-        )
-        # 🌟 نمایش اطلاعات تخفیف در صورت وجود
-        if tx.discount_percent and tx.discount_percent > 0:
-            msg_to_user += (
-                f"💵 قیمت اصلی: <code>{int(tx.original_amount):,}</code> تومان\n"
-                f"🎯 تخفیف ({tx.discount_percent}%): <code>{int(tx.amount):,}</code> تومان\n"
-            )
-        else:
-            msg_to_user += f"💵 مبلغ: <code>{int(tx.amount):,}</code> تومان\n"
-        msg_to_user += (
-            f"🔗 <b>لینک اشتراک شما:</b>\n<code>{sub_url}</code>\n\n"
-            f"💡 آموزش اتصال: ابتدا لینک بالا را کپی کرده و در نرمافزار خود وارد کنید."
-        )
-
-        # 🌟 [جدید] تولید QR Code از لینک اشتراک و ارسال به عنوان عکس
-        if isinstance(callback.message, types.Message):
-            try:
-                import qrcode.constants as _qr_constants  # type: ignore[attr-defined]
-                qr = qrcode.QRCode(
-                    version=1,
-                    error_correction=_qr_constants.ERROR_CORRECT_M,
-                    box_size=10,
-                    border=4,
-                )
-                qr.add_data(sub_url)
-                qr.make(fit=True)
-                qr_image = qr.make_image(fill_color="black", back_color="white")
-                stream = io.BytesIO()
-                # استفاده از pil.save با فرمت PNG
-                qr_image.save(stream, "PNG")  # type: ignore[call-arg]
-                stream.seek(0)
-                qr_file = BufferedInputFile(stream.read(), filename="sub_qr.png")
-
-                await bot.send_photo(
-                    chat_id=user.telegram_id,
-                    photo=qr_file,
-                    caption=msg_to_user,
-                )
-            except Exception as e:
-                logger.error(f"Failed to generate/send QR code for tx {tx_id}: {e}")
-                # fallback: ارسال فقط متن در صورت شکست QR
-                await bot.send_message(chat_id=user.telegram_id, text=msg_to_user)
-
-        # 🌟 پاک کردن مرجع عکس فیش (حفظ سابقه مالی، حذف فقط برای صرفهجویی در فضا)
-        tx.receipt_file_id = None
-        await db_session.commit()
-
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_reject_tx_"))
-async def admin_reject_transaction(callback: types.CallbackQuery, db_session: AsyncSession):
-    if not callback.data or not callback.from_user:
-        await callback.answer()
-        return
-
-    tx_id_str = callback.data.replace("admin_reject_tx_", "")
-    if not tx_id_str.isdigit():
-        await callback.answer("❌ شناسه نامعتبر.", show_alert=True)
-        return
-    tx_id = int(tx_id_str)
-
-    tx = (
-        await db_session.execute(
-            select(Transaction)
-            .options(selectinload(Transaction.user))
-            .where(Transaction.id == tx_id)
-        )
-    ).scalar_one_or_none()
-
-    if not tx or tx.status != "pending":
-        await callback.answer("❌ فیش قبلاً بررسی شده.", show_alert=True)
-        return
-
-    # 🌟 گارد امنیتی: کاربر حتماً باید بارگذاری شده باشد
-    user = tx.user
-    if not user:
-        await callback.answer("❌ کاربر مرتبط با این فیش یافت نشد.", show_alert=True)
-        return
-
-    bot = callback.bot
-    if not bot:
-        await callback.answer("❌ خطای سیستمی: بات در دسترس نیست.", show_alert=True)
-        return
-
-    tx.status = "rejected"
-    await db_session.commit()
-
-    if isinstance(callback.message, types.Message):
-        # 🌟 حذف پیام عکس فیش از چت ادمین برای جلوگیری از شلوغی
-        try:
-            await callback.message.delete()
-        except TelegramBadRequest:
-            pass
-
-    # 🌟 استفاده امن از bot
-    if isinstance(callback.message, types.Message):
-        await bot.send_message(
-            chat_id=user.telegram_id,
-            text=(
-                f"❌ <b>پرداخت شما تایید نشد.</b>\n\n"
-                f"فیش ارسالی برای مبلغ <code>{tx.amount:,}</code> تومان توسط پشتیبانی رد شد."
-            ),
-        )
-    await callback.answer()
-
-
-# ==========================================
-# 🌟 [جدید] داشبورد تیکت‌های پشتیبانی
+# 🌟 داشبورد تیکت‌های پشتیبانی
 # ==========================================
 @router.callback_query(F.data == "admin_support_tickets")
 async def admin_support_tickets_list(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -1478,7 +1412,6 @@ async def admin_support_tickets_list(callback: types.CallbackQuery, db_session: 
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # واکشی تیکت‌های pending این فروشنده بههمراه کاربر
     stmt = (
         select(Ticket)
         .options(selectinload(Ticket.user))
@@ -1574,7 +1507,6 @@ async def admin_reply_ticket_start(callback: types.CallbackQuery, state: FSMCont
         return
     ticket_id = int(ticket_id_str)
 
-    # بررسی وجود تیکت
     ticket = (
         await db_session.execute(select(Ticket).where(Ticket.id == ticket_id))
     ).scalar_one_or_none()
@@ -1602,17 +1534,16 @@ async def admin_reply_ticket_send(message: types.Message, state: FSMContext, db_
         return
 
     data = await state.get_data()
-    ticket_id = data.get("reply_ticket_id")
-    if not ticket_id:
+    ticket_id_raw = data.get("reply_ticket_id")
+    if not ticket_id_raw:
         await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         await state.clear()
         return
 
-    # واکشی تیکت بههمراه کاربر
     stmt = (
         select(Ticket)
         .options(selectinload(Ticket.user))
-        .where(Ticket.id == int(ticket_id))
+        .where(Ticket.id == int(ticket_id_raw))
     )
     ticket = (await db_session.execute(stmt)).scalar_one_or_none()
     if not ticket or not ticket.user:
@@ -1625,11 +1556,9 @@ async def admin_reply_ticket_send(message: types.Message, state: FSMContext, db_
         await message.answer("❌ متن پاسخ نمیتواند خالی باشد.")
         return
 
-    # بروزرسانی وضعیت تیکت
     ticket.status = "answered"
     await db_session.commit()
 
-    # ارسال پاسخ به کاربر از طریق بات
     msg_to_user = (
         f"💬 <b>پاسخ پشتیبانی به تیکت #{ticket.id}</b>\n\n"
         f"📝 <b>پیام اصلی شما:</b>\n{ticket.message_text}\n\n"
@@ -1648,15 +1577,11 @@ async def admin_reply_ticket_send(message: types.Message, state: FSMContext, db_
     await state.clear()
     await message.answer("✅ پاسخ شما برای کاربر ارسال شد.")
 
-    # بازگشت به لیست تیکت‌ها
-    # ساخت یک CallbackQuery مجازی برای فراخوانی مجدد لیست (با استفاده از message)
-    text = "📨 <b>پیامهای پشتیبانی</b>\n\nدر حال بازگشت به لیست..."
-    # بهجای فراخوانی مستقیم، کاربر را با دکمه هدایت میکنیم
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📨 بازگشت به لیست تیکت‌ها", callback_data="admin_support_tickets")],
         [InlineKeyboardButton(text="🔙 بازگشت به پنل", callback_data="back_to_admin_panel")],
     ])
-    await message.answer(text, reply_markup=kb)
+    await message.answer("📨 <b>پیامهای پشتیبانی</b>\n\nدر حال بازگشت به لیست...", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("adm_tkc_"))
@@ -1683,13 +1608,12 @@ async def admin_close_ticket(callback: types.CallbackQuery, db_session: AsyncSes
 
     await callback.answer("✅ تیکت بسته شد.", show_alert=True)
 
-    # بازگشت به لیست تیکتها با model_copy
     new_callback = callback.model_copy(update={"data": "admin_support_tickets"})
     await admin_support_tickets_list(new_callback, db_session)
 
 
 # ==========================================
-# 🌟 [جدید] تنظیمات عضویت اجباری (Force-Join)
+# 🌟 تنظیمات عضویت اجباری (Force-Join)
 # ==========================================
 @router.callback_query(F.data == "admin_force_join")
 async def admin_force_join_menu(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -1769,8 +1693,6 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
     if not message.text or not message.from_user:
         return
 
-    # 🌟 [Bug 3 Fix] فرمت منعطف: «chat_id - url - title»
-    # chat_id میتواند عمومی (@channel) یا خصوصی (-100...) باشد.
     parts = message.text.split(" - ")
     if len(parts) != 3:
         await message.answer(
@@ -1783,7 +1705,6 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
     url = parts[1].strip()
     title = parts[2].strip()
 
-    # اعتبارسنجی فرمت chat_id: باید با @ (عمومی) یا -100 (خصوصی) شروع شود
     is_public_handle = chat_id.startswith("@") and len(chat_id) > 1
     is_private_id = chat_id.startswith("-100") and chat_id.lstrip("-").isdigit() and len(chat_id) > 4
     if not is_public_handle and not is_private_id:
@@ -1803,14 +1724,12 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
         await message.answer("❌ عنوان کانال نمیتواند خالی باشد.")
         return
 
-    # 🌟 [Bug 3 Fix] بررسی زنده API قبل از ذخیره در دیتابیس
     bot = message.bot
     if bot is None:
         await message.answer("❌ خطای داخلی رخ داد. لطفاً مجدداً تلاش کنید.")
         return
 
     try:
-        # تلاش برای گرفتن اطلاعات کانال → تأیید اینکه ربات ادمین است و آیدی صحیح است
         await bot.get_chat(chat_id=chat_id)
     except TelegramBadRequest:
         await message.answer(
@@ -1818,7 +1737,6 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
         )
         return
     except Exception:
-        # شامل TelegramForbiddenError و سایر خطاها
         await message.answer(
             "❌ ربات نتوانست به کانال متصل شود. بررسی کنید آیدی صحیح است (مثل -100...) و ربات در کانال ادمین است."
         )
@@ -1838,7 +1756,6 @@ async def process_force_join_channel_data(message: types.Message, state: FSMCont
     await message.answer(f"✅ کانال «{title}» با موفقیت اضافه شد.")
     await state.clear()
 
-    # نمایش منوی عضویت اجباری به صورت inline (چون این هندلر message-based است)
     channels = (
         await db_session.execute(
             select(ForceJoinChannel)
@@ -1891,13 +1808,12 @@ async def admin_force_join_delete(callback: types.CallbackQuery, db_session: Asy
 
     await callback.answer("✅ حذف شد.", show_alert=True)
 
-    # بازگشت به منوی عضویت اجباری با model_copy
     new_callback = callback.model_copy(update={"data": "admin_force_join"})
     await admin_force_join_menu(new_callback, db_session)
 
 
 # ==========================================
-# 🌟 [جدید] مدیریت مشتریان (Customer Management)
+# 🌟 مدیریت مشتریان (Customer Management)
 # ==========================================
 @router.callback_query(F.data == "admin_my_customers")
 async def admin_my_customers(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -1969,7 +1885,6 @@ async def admin_customers_list(callback: types.CallbackQuery, db_session: AsyncS
                 InlineKeyboardButton(text=f"👤 {u.telegram_id}", callback_data=f"adm_cust_det_{u.id}")
             ])
 
-        # کنترلهای صفحه‌بندی
         nav_row: list[InlineKeyboardButton] = []
         if page > 1:
             nav_row.append(InlineKeyboardButton(text="⬅️ قبلی", callback_data=f"adm_cust_list_{page - 1}"))
@@ -2044,7 +1959,6 @@ async def process_broadcast_message(message: types.Message, state: FSMContext, d
     await state.clear()
     await message.answer(f"✅ ارسال همگانی کامل شد.\n\n📤 موفق: {sent}\n❌ ناموفق: {failed}")
 
-    # نمایش منوی مدیریت مشتریان به صورت inline (چون این هندلر message-based است)
     menu_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 لیست مشتریان", callback_data="adm_cust_list_1")],
         [InlineKeyboardButton(text="📢 پیام همگانی", callback_data="adm_cust_broadcast")],
@@ -2086,7 +2000,6 @@ async def process_customer_search(message: types.Message, state: FSMContext, db_
 
     query_text = message.text.strip()
     if not query_text.isdigit():
-        # مدل User فیلد نام ندارد — فقط جستجوی عددی شناسه تلگرام پشتیبانی می‌شود
         await message.answer("❌ برای جستجو شناسه تلگرام عددی ارسال کنید.")
         return
 
@@ -2127,7 +2040,6 @@ async def admin_customer_detail(callback: types.CallbackQuery, db_session: Async
         return
     user_id = int(user_id_str)
 
-    # 🌟 [Bug 1 Fix] گارد مالکیت: اول فروشنده اجراکننده را واکشی کن
     admin_vendor = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
     ).scalar_one_or_none()
@@ -2142,7 +2054,6 @@ async def admin_customer_detail(callback: types.CallbackQuery, db_session: Async
         await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Bug 1 Fix] بررسی مالکیت: کاربر باید متعلق به این فروشنده باشد
     if user.vendor_id != admin_vendor.id:
         await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
@@ -2178,7 +2089,6 @@ async def admin_wallet_charge_start(callback: types.CallbackQuery, state: FSMCon
         return
     user_id = int(user_id_str)
 
-    # 🌟 [Bug 1 Fix] گارد مالکیت
     admin_vendor = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
     ).scalar_one_or_none()
@@ -2193,7 +2103,6 @@ async def admin_wallet_charge_start(callback: types.CallbackQuery, state: FSMCon
         await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Bug 1 Fix] بررسی مالکیت
     if target_user.vendor_id != admin_vendor.id:
         await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
@@ -2229,12 +2138,13 @@ async def process_wallet_charge_amount(message: types.Message, state: FSMContext
         return
 
     data = await state.get_data()
-    target_user_id = data.get("target_user_id")
-    if not target_user_id:
+    target_user_id_raw = data.get("target_user_id")
+    if not target_user_id_raw:
         await state.clear()
         return
 
-    # 🌟 [Bug 1 Fix] گارد مالکیت مجدد (حتی داخل FSM برای جلوگیری از جعل state)
+    target_user_id = int(target_user_id_raw)
+
     admin_vendor = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == message.from_user.id))
     ).scalar_one_or_none()
@@ -2244,14 +2154,13 @@ async def process_wallet_charge_amount(message: types.Message, state: FSMContext
         return
 
     user = (
-        await db_session.execute(select(User).where(User.id == int(target_user_id)))
+        await db_session.execute(select(User).where(User.id == target_user_id))
     ).scalar_one_or_none()
     if not user:
         await state.clear()
         await message.answer("❌ کاربر یافت نشد.")
         return
 
-    # 🌟 [Bug 1 Fix] بررسی مالکیت قبل از تغییر موجودی
     if user.vendor_id != admin_vendor.id:
         await state.clear()
         await message.answer("❌ دسترسی غیرمجاز")
@@ -2292,7 +2201,6 @@ async def admin_customer_services(callback: types.CallbackQuery, db_session: Asy
         return
     user_id = int(user_id_str)
 
-    # 🌟 [Bug 1 Fix] گارد مالکیت
     admin_vendor = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
     ).scalar_one_or_none()
@@ -2307,7 +2215,6 @@ async def admin_customer_services(callback: types.CallbackQuery, db_session: Asy
         await callback.answer("❌ کاربر یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Bug 1 Fix] بررسی مالکیت
     if user.vendor_id != admin_vendor.id:
         await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
@@ -2344,9 +2251,6 @@ async def admin_customer_services(callback: types.CallbackQuery, db_session: Asy
     await callback.answer()
 
 
-# ==========================================
-# 🌟 [جدید] مانیتورینگ زنده سرویس مشتری (Admin-side)
-# ==========================================
 @router.callback_query(F.data.startswith("adm_usr_srv_"))
 async def admin_customer_service_monitor(callback: types.CallbackQuery, db_session: AsyncSession):
     if not callback.data or not callback.from_user:
@@ -2358,7 +2262,6 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
         return
     tx_id = int(tx_id_str)
 
-    # 🌟 [Bug 1 Fix] گارد مالکیت فروشنده اجراکننده
     admin_vendor = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
     ).scalar_one_or_none()
@@ -2379,7 +2282,6 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
         await callback.answer("❌ سرویس یافت نشد.", show_alert=True)
         return
 
-    # 🌟 [Bug 1 Fix] بررسی مالکیت: کاربر مالک تراکنش باید متعلق به این فروشنده باشد
     if tx.user.vendor_id != admin_vendor.id:
         await callback.answer("❌ دسترسی غیرمجاز", show_alert=True)
         return
@@ -2471,7 +2373,7 @@ async def admin_customer_service_monitor(callback: types.CallbackQuery, db_sessi
 
 
 # ==========================================
-# 🌟 [جدید] مدیریت کدهای تخفیف
+# 🌟 مدیریت کدهای تخفیف
 # ==========================================
 @router.callback_query(F.data == "admin_discounts")
 async def admin_discounts_menu(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -2545,7 +2447,6 @@ async def process_discount_code_input(message: types.Message, state: FSMContext,
         return
 
     code = message.text.strip()
-    # اعتبارسنجی: فقط حروف/اعداد و طول ۳-۵۰
     if not (code.isalnum() and 3 <= len(code) <= 50):
         await message.answer("❌ کد نامعتبر است. فقط حروف انگلیسی و اعداد، بین ۳ تا ۵۰ کاراکتر.")
         return
@@ -2558,7 +2459,6 @@ async def process_discount_code_input(message: types.Message, state: FSMContext,
         await state.clear()
         return
 
-    # بررسی یکتایی کد برای این فروشنده
     exists = (
         await db_session.execute(
             select(DiscountCode).where(DiscountCode.vendor_id == vendor.id, DiscountCode.code == code)
@@ -2589,14 +2489,14 @@ async def process_discount_percent(message: types.Message, state: FSMContext, db
 
     data = await state.get_data()
     code = data.get("discount_code")
-    vendor_id = data.get("discount_vendor_id")
-    if not code or not vendor_id:
+    vendor_id_raw = data.get("discount_vendor_id")
+    if not code or not vendor_id_raw:
         await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         await state.clear()
         return
 
     new_dc = DiscountCode(
-        vendor_id=int(vendor_id),
+        vendor_id=int(vendor_id_raw),
         code=str(code),
         discount_percent=percent,
         is_active=True,
@@ -2606,7 +2506,6 @@ async def process_discount_percent(message: types.Message, state: FSMContext, db
     await state.clear()
     await message.answer(f"✅ کد تخفیف «{code}» با {percent}% تخفیف ایجاد شد.")
 
-    # بازگشت خودکار به پنل
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
     if text:
         await message.answer(text, reply_markup=reply_markup)
@@ -2623,7 +2522,6 @@ async def admin_discount_delete(callback: types.CallbackQuery, db_session: Async
         return
     dc_id = int(dc_id_str)
 
-    # 🌟 گارد مالکیت: اطمینان از اینکه کد متعلق به این فروشنده است
     vendor = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == callback.from_user.id))
     ).scalar_one_or_none()
@@ -2647,13 +2545,12 @@ async def admin_discount_delete(callback: types.CallbackQuery, db_session: Async
     await db_session.commit()
     await callback.answer("✅ کد تخفیف حذف شد", show_alert=True)
 
-    # بازگشت به منوی کدهای تخفیف با model_copy
     new_callback = callback.model_copy(update={"data": "admin_discounts"})
     await admin_discounts_menu(new_callback, db_session)
 
 
 # ==========================================
-# 🌟 [جدید] تنظیمات ریدایرکت فروشنده
+# 🌟 تنظیمات ریدایرکت فروشنده
 # ==========================================
 @router.callback_query(F.data == "admin_redirect")
 async def admin_redirect_menu(callback: types.CallbackQuery, state: FSMContext, db_session: AsyncSession):
@@ -2668,7 +2565,6 @@ async def admin_redirect_menu(callback: types.CallbackQuery, state: FSMContext, 
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # نام فروشنده هدف فعلی
     target_name = "ندارد"
     if vendor.redirect_target_id:
         target = (
@@ -2679,7 +2575,7 @@ async def admin_redirect_menu(callback: types.CallbackQuery, state: FSMContext, 
 
     text = (
         "🔄 <b>تنظیمات ریدایرکت</b>\n\n"
-        "با فعالسازی ریدایرکت، تمام تراکنشها و تیکتهای کاربران شما به فروشنده هدف منتقل می‌شود.\n\n"
+        "با فعال‌سازی ریدایرکت، تمام تراکنش‌ها و تیکت‌های کاربران شما به فروشنده هدف منتقل می‌شود.\n\n"
         f"🎯 <b>فروشنده هدف فعلی:</b> {target_name}\n\n"
         "برای تنظیم فروشنده هدف، شناسه عددی آن فروشنده را ارسال کنید.\n"
         "برای حذف ریدایرکت، عدد 0 را ارسال کنید."
@@ -2719,7 +2615,6 @@ async def process_redirect_target(message: types.Message, state: FSMContext, db_
         await state.clear()
         await message.answer("✅ ریدایرکت با موفقیت حذف شد.")
     else:
-        # بررسی وجود فروشنده هدف + جلوگیری از ریدایرکت به خودش
         if target_id == vendor.id:
             await message.answer("❌ نمی‌توانید ریدایرکت را به خودتان تنظیم کنید.")
             return
@@ -2734,14 +2629,13 @@ async def process_redirect_target(message: types.Message, state: FSMContext, db_
         await state.clear()
         await message.answer(f"✅ ریدایرکت به «{target_vendor.name}» تنظیم شد.")
 
-    # بازگشت خودکار به پنل
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
     if text:
         await message.answer(text, reply_markup=reply_markup)
 
 
 # ==========================================
-# 🌟 [جدید] گزارش مالی پیشرفته
+# 🌟 گزارش مالی پیشرفته
 # ==========================================
 @router.callback_query(F.data == "admin_reports")
 async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -2756,7 +2650,6 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
         await callback.answer("❌ فروشنده یافت نشد.", show_alert=True)
         return
 
-    # ۱) فروش مستقیم خودتان: vendor_id == vendor.id AND (origin_vendor_id IS NULL OR origin_vendor_id == vendor.id)
     direct_sales = await db_session.scalar(
         select(func.coalesce(func.sum(Transaction.amount), 0)).where(
             Transaction.vendor_id == vendor.id,
@@ -2769,7 +2662,6 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
     )
     direct_sales = int(direct_sales or 0)
 
-    # ۲) ارجاع داده شده به همکاران: origin_vendor_id == vendor.id AND vendor_id != vendor.id
     routed_to_others = await db_session.scalar(
         select(func.coalesce(func.sum(Transaction.amount), 0)).where(
             Transaction.origin_vendor_id == vendor.id,
@@ -2779,7 +2671,6 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
     )
     routed_to_others = int(routed_to_others or 0)
 
-    # ۳) دریافت شده از همکاران: vendor_id == vendor.id AND origin_vendor_id IS NOT NULL AND origin_vendor_id != vendor.id
     received_from_others = await db_session.scalar(
         select(func.coalesce(func.sum(Transaction.amount), 0)).where(
             Transaction.vendor_id == vendor.id,
@@ -2790,10 +2681,8 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
     )
     received_from_others = int(received_from_others or 0)
 
-    # ۴) کل واریزی به حساب شما = فروش مستقیم + دریافتی از همکاران
     total_deposits = direct_sales + received_from_others
 
-    # ۵) آمار سرورها (Group by Server): مجموع حجم پلنها و تعداد فروش
     server_stats = (
         await db_session.execute(
             select(
@@ -2816,7 +2705,7 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
         "📊 <b>گزارش مالی</b>\n",
         f"👤 <b>فروشگاه:</b> {vendor.name}\n",
         "━━━━━━━━━━━━━\n",
-        "💼 <b>گزارش فروش تفکیکیشده</b>",
+        "💼 <b>گزارش فروش تفکیک‌شده</b>",
         f"🟢 فروش مستقیم خودتان: <code>{direct_sales:,}</code> تومان",
         f"📤 ارجاع داده شده به همکاران: <code>{routed_to_others:,}</code> تومان",
         f"📥 دریافت شده از همکاران: <code>{received_from_others:,}</code> تومان",
@@ -2828,7 +2717,6 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
 
     if server_stats:
         for row in server_stats:
-            # row: server_name, total_gb, plans_sold
             report_lines.extend([
                 f"🖥 سرور: {row.server_name}",
                 f" ├ 📦 تعداد پلن فروخته شده: {int(row.plans_sold)}",
@@ -2837,7 +2725,6 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
     else:
         report_lines.append("هیچ فروشی ثبت نشده است.")
 
-    # ۵) آمار جهانی بات (فقط برای مالک)
     owner_id_str = os.getenv("OWNER_ID")
     is_owner = bool(owner_id_str and callback.from_user.id == int(owner_id_str))
     if is_owner:
@@ -2858,7 +2745,7 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
             "\n━━━━━━━━━━━━━\n",
             "👑 <b>آمار جهانی بات (مالک)</b>",
             f"💰 مجموع فروش کل بات: <code>{global_sales:,}</code> تومان",
-            f"💽 مجموع حجم فروختهشده: <code>{global_volume}</code> GB",
+            f"💽 مجموع حجم فروخته‌شده: <code>{global_volume}</code> GB",
         ])
 
     text = "\n".join(report_lines)
@@ -2872,7 +2759,7 @@ async def admin_reports(callback: types.CallbackQuery, db_session: AsyncSession)
 
 
 # ==========================================
-# 🌟 [جدید] مدیریت شرکا (Owner Only)
+# 🌟 مدیریت شرکا (Owner Only)
 # ==========================================
 @router.callback_query(F.data == "owner_manage_vendors")
 async def admin_manage_vendors_menu(callback: types.CallbackQuery, db_session: AsyncSession):
@@ -2880,13 +2767,11 @@ async def admin_manage_vendors_menu(callback: types.CallbackQuery, db_session: A
         await callback.answer()
         return
 
-    # گارد مالک
     owner_id_str = os.getenv("OWNER_ID")
     if not (owner_id_str and callback.from_user.id == int(owner_id_str)):
         await callback.answer("❌ این بخش فقط برای مالک بات قابل دسترسی است.", show_alert=True)
         return
 
-    # فهرست تمام شرکا
     vendors = (
         await db_session.execute(select(Vendor).order_by(Vendor.id.asc()))
     ).scalars().all()
@@ -2919,7 +2804,6 @@ async def admin_add_vendor_start(callback: types.CallbackQuery, state: FSMContex
         await callback.answer()
         return
 
-    # گارد مالک
     owner_id_str = os.getenv("OWNER_ID")
     if not (owner_id_str and callback.from_user.id == int(owner_id_str)):
         await callback.answer("❌ دسترسی غیرمجاز.", show_alert=True)
@@ -2951,7 +2835,6 @@ async def process_partner_telegram_id(message: types.Message, state: FSMContext,
         return
     tg_id = int(tg_id_str)
 
-    # بررسی تکراری نبودن
     existing = (
         await db_session.execute(select(Vendor).where(Vendor.telegram_id == tg_id))
     ).scalar_one_or_none()
@@ -2975,14 +2858,14 @@ async def process_partner_name(message: types.Message, state: FSMContext, db_ses
         return
 
     data = await state.get_data()
-    tg_id = data.get("new_vendor_tg_id")
-    if not tg_id:
+    tg_id_raw = data.get("new_vendor_tg_id")
+    if not tg_id_raw:
         await message.answer("❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         await state.clear()
         return
 
     new_vendor = Vendor(
-        telegram_id=int(tg_id),
+        telegram_id=int(tg_id_raw),
         name=name,
         is_active=True,
     )
@@ -2992,11 +2875,10 @@ async def process_partner_name(message: types.Message, state: FSMContext, db_ses
     await message.answer(
         f"✅ شریک جدید با موفقیت ایجاد شد!\n\n"
         f"🏷 نام: {name}\n"
-        f"🆔 تلگرام: <code>{tg_id}</code>\n\n"
+        f"🆔 تلگرام: <code>{int(tg_id_raw)}</code>\n\n"
         "این کاربر با ارسال /admin می‌تواند وارد پنل مدیریت شود."
     )
 
-    # بازگشت خودکار به پنل
     text, reply_markup = await get_admin_panel_content(message.from_user.id, db_session)
     if text:
         await message.answer(text, reply_markup=reply_markup)
