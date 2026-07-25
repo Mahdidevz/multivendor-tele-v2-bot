@@ -15,6 +15,7 @@ from bot.handlers.user_handlers import router as user_router
 from bot.handlers.admin_handlers import router as admin_router
 from bot.middlewares.database import DatabaseMiddleware
 
+
 load_dotenv()
 
 logging.basicConfig(
@@ -34,6 +35,10 @@ async def main():
     if not database_url:
         logger.error("DATABASE_URL is not set in .env file!")
         return
+
+    # 🌟 [رفع ارور psycopg2]: اصلاح خودکار پیش‌وند برای سازگاری با asyncpg در Railway
+    if database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
     # ساخت انجین اتصال به PostgreSQL (echo=False یعنی لاگ کوئری‌های SQL رو تو ترمینال چاپ نکن که شلوغ نشه)
     engine = create_async_engine(database_url, echo=False)
