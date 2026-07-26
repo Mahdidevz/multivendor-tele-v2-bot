@@ -503,7 +503,7 @@ async def process_discount_code(
                 DiscountCode.is_active == True,
             )
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
 
     if not dc:
         await message.answer(
