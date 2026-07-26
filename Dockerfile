@@ -19,4 +19,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # 6. 🌟 اجرای مایگریشن دیتابیس و سپس روشن کردن ربات 🌟
-CMD ["sh", "-c", "alembic upgrade head && python main.py"]
+# دستور اجرای موقت برای گرفتن ارور دقیق پایتون
+CMD ["sh", "-c", "alembic upgrade head && python -u main.py"]
