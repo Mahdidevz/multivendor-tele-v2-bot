@@ -789,9 +789,6 @@ async def process_wallet_buy(
             f"🖥 سرور: {server.name}\n\n"
             f"🔗 <b>لینک اشتراک:</b>\n<code>{sub_url}</code>"
         )
-        back_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]
-        ])
         try:
             import qrcode.constants as _qr_constants  # type: ignore[import-untyped]
 
@@ -815,23 +812,45 @@ async def process_wallet_buy(
                     chat_id=user.telegram_id,
                     photo=qr_file,
                     caption=caption,
-                    reply_markup=back_kb
                 )
         except Exception:
             if isinstance(callback.message, types.Message):
-                await callback.message.edit_text(caption, reply_markup=back_kb)
+                await callback.message.edit_text(caption)
     else:
         user.wallet_balance += final_price
         new_tx.status = "failed"
         await db_session.commit()
-        fail_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 بازگشت به منوی اصلی", callback_data="back_to_main")]
-        ])
         if isinstance(callback.message, types.Message):
-            await callback.message.edit_text(
-                "❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد.",
-                reply_markup=fail_kb
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+
+        if callback.bot is not None:
+            await callback.bot.send_message(
+                chat_id=user.telegram_id,
+                text="❌ متاسفانه در ارتباط با سرور مشکلی پیش آمد. مبلغ به طور کامل به کیف پول شما برگشت داده شد."
             )
+    if callback.bot is not None:
+        wallet_balance = int(user.wallet_balance)
+        first_name = callback.from_user.first_name if callback.from_user else MESSAGES.get("default_user", "کاربر")
+        welcome_text = MESSAGES["welcome"].format(name=first_name, balance=wallet_balance)
+
+        main_menu_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=BUTTONS["buy_new_service"], callback_data="buy_new_service")],
+                [InlineKeyboardButton(text=BUTTONS["my_services"], callback_data="my_services"),
+                 InlineKeyboardButton(text=BUTTONS["charge_wallet"], callback_data="charge_wallet")],
+                [InlineKeyboardButton(text=BUTTONS["user_profile"], callback_data="user_profile"),
+                 InlineKeyboardButton(text=BUTTONS["support"], callback_data="support")],
+                [InlineKeyboardButton(text=BUTTONS["free_test"], callback_data="free_test_start")],
+            ]
+        )
+        await callback.bot.send_message(
+            chat_id=user.telegram_id,
+            text=welcome_text,
+            reply_markup=main_menu_keyboard
+        )
 
 
 # --- ۷. دریافت عکس رسید و ارسال به پی‌وی ادمین ---
