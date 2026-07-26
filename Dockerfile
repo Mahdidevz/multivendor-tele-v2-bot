@@ -1,22 +1,22 @@
-# 1. استفاده از پایتون نسخه 3.11 (سبک و سریع)
+# 1. استفاده از پایتون
 FROM python:3.11-slim
 
-# 2. تنظیم پوشه کاری داخل سرور
+# 2. ارسال لحظه‌ای لاگ‌ها به Railway (برای رفع باگ‌های احتمالی)
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# 3. 🌟 نصب قطعی ابزار pg_dump از مخازن اصلی لینوکس 🌟
+# 3. نصب قطعی ابزار pg_dump
 RUN apt-get update && \
     apt-get install -y postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
-# 4. کپی کردن فایل نیازمندی‌ها
+# 4. کپی و نصب نیازمندی‌ها
 COPY requirements.txt .
-
-# 5. نصب کتابخانه‌های پایتون (از جمله aiogram و sqlalchemy)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 6. کپی کردن کل کدهای ربات به داخل سرور
+# 5. کپی کل پروژه
 COPY . .
 
-# 7. دستور اجرای ربات
-CMD ["python", "main.py"]
+# 6. 🌟 اجرای مایگریشن دیتابیس و سپس روشن کردن ربات 🌟
+CMD ["sh", "-c", "alembic upgrade head && python main.py"]
