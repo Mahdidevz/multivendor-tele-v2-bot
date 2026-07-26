@@ -100,8 +100,7 @@ async def main():
     # ⏱️ فعلاً روی هر ۵ دقیقه تنظیمه تا مطمئن بشید روش جدید بکاپ‌گیری (بدون pg_dump) درست کار می‌کنه.
     # بعد از اینکه یکی دو بار بکاپ رو با موفقیت توی پی‌وی گرفتید، این خط رو کامنت کنید
     # و خط hours=24 پایینی رو از کامنت در بیارید تا بکاپ روزی یک بار گرفته بشه:
-    scheduler.add_job(perform_database_backup, 'interval', minutes=1, args=[bot])
-    # scheduler.add_job(perform_database_backup, 'interval', hours=24, args=[bot])
+    scheduler.add_job(perform_database_backup, 'interval', hours=24, args=[bot])
 
     scheduler.start()
 
