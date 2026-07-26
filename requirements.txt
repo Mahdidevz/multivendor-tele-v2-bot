@@ -7,3 +7,4 @@ python-dotenv>=1.0.1
 redis>=5.0.3
 APScheduler>=3.10.4
 qrcode[pil]>=7.4.2
+apscheduler

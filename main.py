@@ -14,6 +14,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from bot.handlers.user_handlers import router as user_router
 from bot.handlers.admin_handlers import router as admin_router
 from bot.middlewares.database import DatabaseMiddleware
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from core.utils.backup import perform_database_backup
+
 
 
 load_dotenv()
@@ -62,6 +65,19 @@ async def main():
     )
 
     dp = Dispatcher()
+
+    # 🌟 راه‌اندازی سیستم زمان‌بندی (Scheduler)
+    scheduler = AsyncIOScheduler()
+
+        # ⏱️ برای تست: هر 5 دقیقه یکبار اجرا می‌شود
+    scheduler.add_job(perform_database_backup, 'interval', minutes=5, args=[bot])
+
+        # ⏱️ هر وقت خواستید برای محیط واقعی (هر 24 ساعت) فعال کنید،
+        # خط بالا را پاک (یا کامنت) کنید و خط زیر را از کامنت در بیاورید:
+        # scheduler.add_job(perform_database_backup, 'interval', hours=24, args=[bot])
+
+        # روشن کردن زمان‌بند در پس‌زمینه
+    scheduler.start()
 
     # ۳. تزریق میدل‌ور دیتابیس به تمام رویدادهای ربات
     dp.update.outer_middleware(DatabaseMiddleware(session_pool=session_pool))
