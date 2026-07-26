@@ -70,7 +70,7 @@ async def main():
     scheduler = AsyncIOScheduler()
 
         # ⏱️ برای تست: هر 5 دقیقه یکبار اجرا می‌شود
-    scheduler.add_job(perform_database_backup, 'interval', minutes=5, args=[bot])
+    scheduler.add_job(perform_database_backup, 'interval', minutes=1, args=[bot])
 
         # ⏱️ هر وقت خواستید برای محیط واقعی (هر 24 ساعت) فعال کنید،
         # خط بالا را پاک (یا کامنت) کنید و خط زیر را از کامنت در بیاورید:
